@@ -128,10 +128,11 @@ class EndingDeductionPanel(QWidget):
     navigate_event_requested = Signal(str)
     data_changed = Signal()
 
-    def __init__(self, events: List[Event], endings: List[Ending], parent=None):
+    def __init__(self, events: List[Event], endings: List[Ending], initial_state: Optional[GameState] = None, parent=None):
         super().__init__(parent)
         self._events = events
         self._endings = endings
+        self._initial_state = initial_state or GameState()
         self._current_result: Optional[ValidationResult] = None
         self._current_ending: Optional[Ending] = None
         self._build_ui()
@@ -204,6 +205,14 @@ class EndingDeductionPanel(QWidget):
 
         rv.addWidget(top)
 
+        self.lbl_initial_state = QLabel("📌 开局初始：")
+        self.lbl_initial_state.setStyleSheet(
+            "background: #2a2a35; border: 1px solid #44445a; border-radius: 4px;"
+            "padding: 6px 10px; color: #c9b3ff; font-weight: bold;"
+        )
+        rv.addWidget(self.lbl_initial_state)
+        self._update_initial_state_label()
+
         self.tree_timeline = QTreeWidget()
         self.tree_timeline.setHeaderLabels(["章节/事件", "状态", "玩家选择 / 影响", "恐惧值 / 关键条件"])
         self.tree_timeline.header().setStretchLastSection(False)
@@ -245,9 +254,11 @@ class EndingDeductionPanel(QWidget):
         splitter.setStretchFactor(1, 1)
         root.addWidget(splitter)
 
-    def set_data(self, events: List[Event], endings: List[Ending]):
+    def set_data(self, events: List[Event], endings: List[Ending], initial_state: Optional[GameState] = None):
         self._events = events
         self._endings = endings
+        if initial_state is not None:
+            self._initial_state = initial_state
         self._current_result = None
         self._current_ending = None
         self._refresh_endings()
@@ -256,6 +267,21 @@ class EndingDeductionPanel(QWidget):
         self.lst_missing.clear()
         self.lbl_summary.setText("")
         self._set_status("等待校验...", COLOR_INFO)
+        self._update_initial_state_label()
+
+    def _update_initial_state_label(self):
+        st = self._initial_state
+        parts = [f"恐惧值:{st.fear_level}"]
+        flags_on = [k for k, v in st.flags.items() if v]
+        if flags_on:
+            parts.append(f"标记:{len(flags_on)}个")
+        clues_on = [k for k, v in st.clues.items() if v]
+        if clues_on:
+            parts.append(f"线索:{len(clues_on)}个")
+        chars = [f"{k}={str(v)}" for k, v in st.characters.items()]
+        if chars:
+            parts.append(f"角色:{len(chars)}个")
+        self.lbl_initial_state.setText("📌 开局初始：" + " ｜ ".join(parts))
 
     def get_endings(self) -> List[Ending]:
         return self._endings
@@ -329,7 +355,7 @@ class EndingDeductionPanel(QWidget):
             QMessageBox.warning(self, "警告", "当前没有任何事件，请先在「事件录入」中添加。")
             return
         validator = CausalityValidator(self._events, self._endings)
-        result = validator.simulate_path_to_ending(self._current_ending)
+        result = validator.simulate_path_to_ending(self._current_ending, self._initial_state)
         extra = validator.find_dialogue_contradictions(result, self._current_ending)
         result.contradictions.extend(extra)
         self._current_result = result
@@ -386,7 +412,10 @@ class EndingDeductionPanel(QWidget):
 
         status_text = ""
         status_color = COLOR_VALID
-        if step.event_condition_status == LinkStatus.BROKEN:
+        if step.event_condition_status == LinkStatus.SKIPPED:
+            status_text = "🚫 未触发"
+            status_color = COLOR_BROKEN
+        elif step.event_condition_status == LinkStatus.BROKEN:
             status_text = "⛔ 跳过"
             status_color = COLOR_BROKEN
         elif step.event_condition_status == LinkStatus.WARN:
@@ -396,17 +425,34 @@ class EndingDeductionPanel(QWidget):
             status_text = "✔ 触发"
             status_color = COLOR_VALID
 
+        title_note = ""
+        if step.event_condition_status == LinkStatus.SKIPPED:
+            title_note = "  （前置条件不满足，已跳过）"
+
         ev_item = QTreeWidgetItem([
-            f"  📌 {step.event.title}",
+            f"  📌 {step.event.title}{title_note}",
             status_text,
             "",
             f"恐惧值 {step.state_before.fear_level} → {step.state_after.fear_level if step.state_after else '?'}",
         ])
         ev_item.setData(0, Qt.UserRole, step.event.id)
+        ev_item.setData(1, Qt.UserRole, step)
         ev_item.setForeground(1, QBrush(status_color))
         ev_item.setBackground(1, QBrush(status_color.lighter(250)))
         ev_item.setForeground(3, QBrush(COLOR_INFO))
+        if step.event_condition_status == LinkStatus.SKIPPED:
+            ev_item.setForeground(0, QBrush(COLOR_BROKEN))
+            f = QFont(); f.setItalic(True); ev_item.setFont(0, f)
         ch_item.addChild(ev_item)
+
+        if step.met_event_conditions:
+            for cond in step.met_event_conditions:
+                sub = QTreeWidgetItem([
+                    "", "✓", f"【满足前置】{cond.human_readable()}", ""
+                ])
+                sub.setForeground(1, QBrush(COLOR_VALID))
+                sub.setForeground(2, QBrush(COLOR_VALID))
+                ev_item.addChild(sub)
 
         if step.broken_event_conditions:
             for cond in step.broken_event_conditions:
@@ -417,7 +463,48 @@ class EndingDeductionPanel(QWidget):
                 sub.setForeground(2, QBrush(COLOR_BROKEN))
                 ev_item.addChild(sub)
 
-        if step.selected_choice:
+        if step.all_choice_scores and step.event_condition_status != LinkStatus.SKIPPED:
+            score_item = QTreeWidgetItem([
+                "", "", f"📊 选择评分预览（点击编辑可对比各走向）：", ""
+            ])
+            score_item.setForeground(2, QBrush(COLOR_WARN))
+            f2 = QFont(); f2.setBold(True); score_item.setFont(2, f2)
+            ev_item.addChild(score_item)
+
+            best_score = max((s.score for s in step.all_choice_scores), default=0)
+            for cs in step.all_choice_scores:
+                is_best = cs.score == best_score and best_score > 0
+                is_selected = (step.selected_choice and cs.choice.id == step.selected_choice.id)
+                badge = ""
+                if is_selected and is_best:
+                    badge = "  🏆"
+                elif is_selected:
+                    badge = "  👤 (当前选择)"
+                elif is_best:
+                    badge = "  🎯 (最优)"
+
+                met_str = "、".join(cs.met_conditions[:2]) if cs.met_conditions else ""
+                prog_str = "、".join(cs.progress_conditions[:2]) if cs.progress_conditions else ""
+                extra = []
+                if met_str:
+                    extra.append(f"✓ {met_str}")
+                if prog_str:
+                    extra.append(f"↗ {prog_str}")
+                extra_str = f"  [{'; '.join(extra)}]" if extra else ""
+
+                sub = QTreeWidgetItem([
+                    "", "",
+                    f"  [{cs.score:2d}分] {cs.choice.text or '(未命名)'}{badge}{extra_str}",
+                    ""
+                ])
+                if is_selected:
+                    sub.setBackground(2, QBrush(50, 60, 80))
+                if is_best:
+                    sub.setForeground(2, QBrush(COLOR_VALID))
+                sub.setData(0, Qt.UserRole, step.event.id)
+                ev_item.addChild(sub)
+
+        if step.selected_choice and step.event_condition_status != LinkStatus.SKIPPED:
             choice_text = step.selected_choice.text or "(未命名选项)"
             note = f"  {step.note}" if step.note else ""
             ch_item2 = QTreeWidgetItem([
@@ -437,6 +524,12 @@ class EndingDeductionPanel(QWidget):
                     c = COLOR_VALID
                 sub.setForeground(2, QBrush(c))
                 ev_item.addChild(sub)
+        elif step.event_condition_status == LinkStatus.SKIPPED:
+            sub = QTreeWidgetItem([
+                "", "", "🔒 事件未触发，以上缺失条件满足后才可进入", ""
+            ])
+            sub.setForeground(2, QBrush(COLOR_BROKEN))
+            ev_item.addChild(sub)
 
         state_after = step.state_after or GameState()
         clues_active = [k for k, v in state_after.clues.items() if v]

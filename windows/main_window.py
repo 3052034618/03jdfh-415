@@ -163,9 +163,9 @@ class MainWindow(QMainWindow):
         self._update_status("已修改 · 记得保存")
 
     def _sync_panels(self):
-        self.panel_event.set_data(self._events, self._endings)
-        self.panel_deduction.set_data(self._events, self._endings)
-        self.panel_contradiction.set_data(self._events, self._endings)
+        self.panel_event.set_data(self._events, self._endings, self._initial_state)
+        self.panel_deduction.set_data(self._events, self._endings, self._initial_state)
+        self.panel_contradiction.set_data(self._events, self._endings, self._initial_state)
 
     def _on_save(self):
         ok = self._storage.save(self._events, self._endings, self._initial_state, self._metadata)

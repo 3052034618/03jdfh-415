@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QFont, QColor, QBrush
 
-from models import Event, Ending, Condition
+from models import Event, Ending, Condition, GameState, ChoiceEffectType
 from services.validator import (
     CausalityValidator, ValidationResult, LinkStatus, Contradiction,
 )
@@ -26,10 +26,11 @@ class ContradictionPanel(QWidget):
     navigate_event_requested = Signal(str)
     navigate_ending_requested = Signal(str)
 
-    def __init__(self, events: List[Event], endings: List[Ending], parent=None):
+    def __init__(self, events: List[Event], endings: List[Ending], initial_state: Optional[GameState] = None, parent=None):
         super().__init__(parent)
         self._events = events
         self._endings = endings
+        self._initial_state = initial_state or GameState()
         self._results_cache: Dict[str, ValidationResult] = {}
         self._build_ui()
 
@@ -147,9 +148,11 @@ class ContradictionPanel(QWidget):
 
         self._current_issue: Optional[Contradiction] = None
 
-    def set_data(self, events: List[Event], endings: List[Ending]):
+    def set_data(self, events: List[Event], endings: List[Ending], initial_state: Optional[GameState] = None):
         self._events = events
         self._endings = endings
+        if initial_state is not None:
+            self._initial_state = initial_state
         self._results_cache.clear()
         self.tree_issues.clear()
         self.ed_detail.clear()
@@ -166,7 +169,7 @@ class ContradictionPanel(QWidget):
             QMessageBox.information(self, "提示", "请先添加事件与结局。")
             return
         validator = CausalityValidator(self._events, self._endings)
-        self._results_cache = validator.validate_all_endings()
+        self._results_cache = validator.validate_all_endings(self._initial_state)
         for eid, res in self._results_cache.items():
             ending = next((e for e in self._endings if e.id == eid), None)
             if ending:
@@ -174,6 +177,7 @@ class ContradictionPanel(QWidget):
                 res.contradictions.extend(extra)
         self._refresh_list()
         self._update_health()
+        self._update_coverage_analysis(validator)
 
     def _refresh_list(self):
         self.tree_issues.clear()
@@ -242,34 +246,7 @@ class ContradictionPanel(QWidget):
         sev_label = "严重错误" if issue.severity == "error" else "建议改进"
         sev_color = COLOR_BROKEN if issue.severity == "error" else COLOR_WARN
 
-        related_parts = []
-        if issue.related_event_id:
-            ev = next((e for e in self._events if e.id == issue.related_event_id), None)
-            if ev:
-                related_parts.append(f"相关事件：第{ev.chapter}章「{ev.title}」")
-        if issue.related_ending_id:
-            end = next((e for e in self._endings if e.id == issue.related_ending_id), None)
-            if end:
-                related_parts.append(f"相关结局：「{end.title}」")
-        related_text = "；".join(related_parts) if related_parts else "（无关联对象）"
-
-        html = f"""
-        <div style="padding: 4px;">
-            <h3 style="color: {sev_color.name()}; margin: 0 0 10px 0;">【{sev_label}】{issue.category}</h3>
-            <div style="background: #333340; padding: 10px; border-radius: 6px; margin-bottom: 12px;">
-                <b style="color: #ffcc99;">💬 具体问题：</b><br>
-                <span style="color: #fff;">{issue.message}</span>
-            </div>
-            <div style="background: #2e3b2e; padding: 10px; border-radius: 6px; margin-bottom: 12px; border: 1px solid #3e5b3e;">
-                <b style="color: #9fe59f;">💡 修改建议：</b><br>
-                <span style="color: #e6ffe6;">{issue.suggestion}</span>
-            </div>
-            <div style="color: #888; font-size: 12px;">
-                📍 关联信息：{related_text}
-            </div>
-        </div>
-        """
-        self.ed_detail.setHtml(html)
+        self.ed_detail.setHtml(self._render_issue_detail(issue))
 
         self.btn_goto_event.setEnabled(bool(issue.related_event_id))
         self.btn_goto_ending.setEnabled(bool(issue.related_ending_id))
@@ -350,3 +327,152 @@ class ContradictionPanel(QWidget):
         if not tips:
             tips.append("开始写作吧！先构思事件，再为每个结局定义必要条件。")
         self.txt_health_tips.setPlainText("\n".join(f"• {t}" for t in tips))
+
+    def _update_coverage_analysis(self, validator: CausalityValidator):
+        entities = validator.get_known_entities()
+        clues = entities.get("clues", [])
+        chars = entities.get("characters", [])
+
+        all_dialogue_refs: Dict[str, List[dict]] = {}
+        dialogue_issues = []
+
+        for ending in self._endings:
+            for dialogue in ending.dialogue_hints:
+                refs = validator._dialogue_analyzer.extract_references(dialogue)
+                for ref in refs:
+                    key = f"{ending.title}::{dialogue[:30]}..."
+                    all_dialogue_refs.setdefault(ref.reference, []).append({
+                        "ending": ending.title,
+                        "ending_id": ending.id,
+                        "dialogue": dialogue,
+                        "ref": ref,
+                    })
+
+        all_refs = sorted(all_dialogue_refs.keys())
+
+        coverage_info = []
+        missing_coverage = []
+
+        total_refs = len(all_dialogue_refs)
+        covered = 0
+        for ref_name, occurrences in all_dialogue_refs.items():
+            first = occurrences[0]
+            ref_type = first["ref"].reference_type
+            type_label = {"clue": "线索", "character": "角色", "location": "地点"}.get(ref_type, ref_type)
+            has_provider = self._check_if_provided(ref_name, ref_type, validator)
+            status = "✅" if has_provider else "⚠"
+            if has_provider:
+                covered += 1
+            else:
+                missing_coverage.append({
+                    "name": ref_name,
+                    "type": type_label,
+                    "occurrences": occurrences,
+                })
+            occurrence_desc = "、".join(o["ending"] for o in occurrences[:3])
+            coverage_info.append(
+                "{0} {1}「{2}」（{3}次引用，出现在：{4}）".format(
+                    status, type_label, ref_name, len(occurrences), occurrence_desc
+                )
+            )
+
+        pct = covered / max(total_refs, 1) * 100 if total_refs else 100
+
+        extra_tips = []
+        extra_tips.append(
+            "📝 台词引用分析（共 {0} 个不同元素，{1} 个有铺垫，覆盖率 {2:.0f}%）".format(
+                total_refs, covered, pct
+            )
+        )
+        if coverage_info:
+            extra_tips.extend(coverage_info[:10])
+        if missing_coverage:
+            extra_tips.append("")
+            extra_tips.append("⚠ 缺失铺垫的引用：")
+            for m in missing_coverage:
+                occ = m["occurrences"]
+                first_occ = occ[0]
+                ch_num = None
+                prov = validator._dialogue_analyzer._find_provider_event_for_clue(m["name"]) if m["type"] == "线索" else None
+                if not prov and m["type"] == "线索":
+                    prov = validator._find_source_event_for_condition.__self__
+                end_titles = "、".join(o["ending"] for o in occ[:3])
+                extra_tips.append(
+                    "  • {0}「{1}」被 {2} 的台词引用，但剧本中没有事件能让玩家获得它".format(
+                        m['type'], m['name'], end_titles
+                    )
+                )
+
+        current = self.txt_health_tips.toPlainText()
+        full = current + "\n\n" + "\n".join(extra_tips)
+        self.txt_health_tips.setPlainText(full)
+
+    def _check_if_provided(self, ref_name: str, ref_type: str, validator) -> bool:
+        if ref_type == "clue":
+            for event in self._events:
+                for choice in event.choices:
+                    for effect in choice.effects:
+                        if effect.effect_type == ChoiceEffectType.SET_CLUE and effect.target == ref_name:
+                            return True
+        elif ref_type == "character":
+            for event in self._events:
+                for choice in event.choices:
+                    for effect in choice.effects:
+                        if effect.target == ref_name and effect.effect_type in (
+                            ChoiceEffectType.SET_CHAR_ALIVE,
+                            ChoiceEffectType.SET_CHAR_DEAD,
+                            ChoiceEffectType.SET_CHAR_MISSING,
+                            ChoiceEffectType.SET_CHAR_INSANE,
+                        ):
+                            return True
+            if self._initial_state:
+                if ref_type == "clue" and self._initial_state.has_clue(ref_name):
+                    return True
+                if ref_type == "character" and ref_name in self._initial_state.characters:
+                    return True
+        return False
+
+    def _render_issue_detail(self, issue: Contradiction) -> str:
+        sev_label = "严重错误" if issue.severity == "error" else "建议改进"
+        sev_color = COLOR_BROKEN if issue.severity == "error" else COLOR_WARN
+
+        related_parts = []
+        if issue.related_event_id:
+            ev = next((e for e in self._events if e.id == issue.related_event_id), None)
+            if ev:
+                related_parts.append("相关事件：第{0}章「{1}」".format(ev.chapter, ev.title))
+        if issue.related_ending_id:
+            end = next((e for e in self._endings if e.id == issue.related_ending_id), None)
+            if end:
+                related_parts.append("相关结局：「{0}」".format(end.title))
+        if issue.related_chapter:
+            related_parts.append("建议回第 {0} 章检查".format(issue.related_chapter))
+        related_text = "；".join(related_parts) if related_parts else "（无关联对象）"
+
+        dialogue_block = ""
+        if issue.dialogue_ref:
+            dialogue_block = f"""
+            <div style="background: #3a2e2e; padding: 10px; border-radius: 6px; margin-bottom: 12px; border-left: 4px solid #ff9999;">
+                <b style="color: #ffcc99;">🎬 相关台词：</b><br>
+                <span style="color: #fff; font-style: italic;">「{issue.dialogue_ref}」</span>
+            </div>
+            """
+
+        html = f"""
+        <div style="padding: 4px;">
+            <h3 style="color: {sev_color.name()}; margin: 0 0 10px 0;">【{sev_label}】{issue.category}</h3>
+            {dialogue_block}
+            <div style="background: #333340; padding: 10px; border-radius: 6px; margin-bottom: 12px;">
+                <b style="color: #ffcc99;">💬 具体问题：</b><br>
+                <span style="color: #fff;">{issue.message}</span>
+            </div>
+            <div style="background: #2e3b2e; padding: 10px; border-radius: 6px; margin-bottom: 12px; border: 1px solid #3e5b3e;">
+                <b style="color: #9fe59f;">💡 修改建议：</b><br>
+                <span style="color: #e6ffe6;">{issue.suggestion}</span>
+            </div>
+            <div style="color: #888; font-size: 12px;">
+                📍 关联信息：{related_text}
+            </div>
+        </div>
+        """
+        return html

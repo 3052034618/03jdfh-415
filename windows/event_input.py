@@ -26,10 +26,11 @@ from .common import (
 class EventInputPanel(QWidget):
     data_changed = Signal()
 
-    def __init__(self, events: List[Event], endings: List[Ending], parent=None):
+    def __init__(self, events: List[Event], endings: List[Ending], initial_state: Optional[GameState] = None, parent=None):
         super().__init__(parent)
         self._events = events
         self._endings = endings
+        self._initial_state = initial_state or GameState()
         self._current_event: Optional[Event] = None
         self._build_ui()
         self._refresh_event_tree()
@@ -83,6 +84,7 @@ class EventInputPanel(QWidget):
         self.right_layout.setContentsMargins(4, 4, 4, 4)
         self.right_layout.setSpacing(8)
 
+        self._build_initial_state_editor()
         self._build_event_editor()
 
         scroll.setWidget(right_panel)
@@ -93,6 +95,229 @@ class EventInputPanel(QWidget):
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
         root_layout.addWidget(splitter)
+
+    def _build_initial_state_editor(self):
+        gb = QGroupBox("🎬 剧本开局初始状态")
+        v = QVBoxLayout(gb)
+
+        row1 = QHBoxLayout()
+        row1.addWidget(QLabel("开局恐惧值："))
+        self.sp_initial_fear = QSpinBox()
+        self.sp_initial_fear.setRange(0, 100)
+        self.sp_initial_fear.setToolTip("游戏开始时玩家的恐惧值")
+        self.sp_initial_fear.valueChanged.connect(self._on_initial_fear_change)
+        row1.addWidget(self.sp_initial_fear)
+        row1.addStretch()
+
+        btn_add_flag = QPushButton("+ 添加开局标记")
+        btn_add_flag.clicked.connect(self._add_initial_flag)
+        btn_add_clue = QPushButton("+ 添加初始线索")
+        btn_add_clue.clicked.connect(self._add_initial_clue)
+        btn_add_char = QPushButton("+ 添加初始角色")
+        btn_add_char.clicked.connect(self._add_initial_character)
+        row1.addWidget(btn_add_flag)
+        row1.addWidget(btn_add_clue)
+        row1.addWidget(btn_add_char)
+        v.addLayout(row1)
+
+        row2 = QHBoxLayout()
+        col_flags = QVBoxLayout()
+        col_flags.addWidget(QLabel("🏷 开局标记："))
+        self.lst_initial_flags = QListWidget()
+        self.lst_initial_flags.setFixedHeight(80)
+        self.lst_initial_flags.itemDoubleClicked.connect(self._edit_initial_flag)
+        col_flags.addWidget(self.lst_initial_flags)
+        row_flag_btns = QHBoxLayout()
+        btn_flag_del = QPushButton("删除")
+        btn_flag_del.setProperty("danger", True)
+        btn_flag_del.clicked.connect(self._del_initial_flag)
+        row_flag_btns.addWidget(btn_flag_del)
+        row_flag_btns.addStretch()
+        col_flags.addLayout(row_flag_btns)
+        row2.addLayout(col_flags, 1)
+
+        col_clues = QVBoxLayout()
+        col_clues.addWidget(QLabel("💡 初始线索："))
+        self.lst_initial_clues = QListWidget()
+        self.lst_initial_clues.setFixedHeight(80)
+        self.lst_initial_clues.itemDoubleClicked.connect(self._edit_initial_clue)
+        col_clues.addWidget(self.lst_initial_clues)
+        row_clue_btns = QHBoxLayout()
+        btn_clue_del = QPushButton("删除")
+        btn_clue_del.setProperty("danger", True)
+        btn_clue_del.clicked.connect(self._del_initial_clue)
+        row_clue_btns.addWidget(btn_clue_del)
+        row_clue_btns.addStretch()
+        col_clues.addLayout(row_clue_btns)
+        row2.addLayout(col_clues, 1)
+
+        col_chars = QVBoxLayout()
+        col_chars.addWidget(QLabel("👥 初始角色状态："))
+        self.lst_initial_chars = QListWidget()
+        self.lst_initial_chars.setFixedHeight(80)
+        self.lst_initial_chars.itemDoubleClicked.connect(self._edit_initial_char)
+        col_chars.addWidget(self.lst_initial_chars)
+        row_char_btns = QHBoxLayout()
+        btn_char_del = QPushButton("删除")
+        btn_char_del.setProperty("danger", True)
+        btn_char_del.clicked.connect(self._del_initial_char)
+        row_char_btns.addWidget(btn_char_del)
+        row_char_btns.addStretch()
+        col_chars.addLayout(row_char_btns)
+        row2.addLayout(col_chars, 1)
+
+        v.addLayout(row2)
+        self.right_layout.addWidget(gb)
+
+    def _refresh_initial_state_editor(self):
+        self.sp_initial_fear.blockSignals(True)
+        self.sp_initial_fear.setValue(self._initial_state.fear_level)
+        self.sp_initial_fear.blockSignals(False)
+
+        self.lst_initial_flags.clear()
+        for k, v in self._initial_state.flags.items():
+            item = QListWidgetItem(f"{'✓' if v else '✗'} {k}")
+            item.setData(Qt.UserRole, k)
+            item.setForeground(QBrush(COLOR_VALID if v else COLOR_BROKEN))
+            self.lst_initial_flags.addItem(item)
+
+        self.lst_initial_clues.clear()
+        for k, v in self._initial_state.clues.items():
+            item = QListWidgetItem(f"{'✓' if v else '✗'} {k}")
+            item.setData(Qt.UserRole, k)
+            item.setForeground(QBrush(COLOR_VALID if v else COLOR_BROKEN))
+            self.lst_initial_clues.addItem(item)
+
+        self.lst_initial_chars.clear()
+        for k, v in self._initial_state.characters.items():
+            label = {
+                "alive": "存活", "dead": "死亡", "missing": "失踪", "insane": "发疯"
+            }.get(v.value, v.value)
+            color = COLOR_VALID if v.value == "alive" else COLOR_BROKEN
+            item = QListWidgetItem(f"{k} → {label}")
+            item.setData(Qt.UserRole, k)
+            item.setForeground(QBrush(color))
+            self.lst_initial_chars.addItem(item)
+
+    def _on_initial_fear_change(self, val: int):
+        self._initial_state.fear_level = val
+        self.data_changed.emit()
+
+    def _add_initial_flag(self):
+        name, ok = QInputDialog.getText(self, "添加开局标记", "标记ID（英文/拼音，如 已入疗养院）：")
+        if not ok or not name.strip():
+            return
+        name = name.strip()
+        self._initial_state.set_flag(name, True)
+        self._refresh_initial_state_editor()
+        self.data_changed.emit()
+
+    def _edit_initial_flag(self, item: QListWidgetItem):
+        key = item.data(Qt.UserRole)
+        cur_val = self._initial_state.get_flag(key)
+        items = ["✓ 已标记（True）", "✗ 未标记（False）"]
+        choice, ok = QInputDialog.getItem(
+            self, "编辑标记", f"选择标记「{key}」的值：",
+            items, 0 if cur_val else 1, False
+        )
+        if ok:
+            new_val = choice.startswith("✓")
+            self._initial_state.set_flag(key, new_val)
+            self._refresh_initial_state_editor()
+            self.data_changed.emit()
+
+    def _del_initial_flag(self):
+        row = self.lst_initial_flags.currentRow()
+        if row < 0:
+            return
+        key = self.lst_initial_flags.item(row).data(Qt.UserRole)
+        del self._initial_state.flags[key]
+        self._refresh_initial_state_editor()
+        self.data_changed.emit()
+
+    def _add_initial_clue(self):
+        name, ok = QInputDialog.getText(self, "添加初始线索", "线索ID（如 祭坛照片）：")
+        if not ok or not name.strip():
+            return
+        name = name.strip()
+        items = ["✓ 已获得（True）", "✗ 未获得（False）"]
+        choice, ok2 = QInputDialog.getItem(
+            self, "初始线索状态", f"选择线索「{name}」的初始状态：",
+            items, 0, False
+        )
+        if ok2:
+            val = choice.startswith("✓")
+            self._initial_state.add_clue(name, val)
+            self._refresh_initial_state_editor()
+            self.data_changed.emit()
+
+    def _edit_initial_clue(self, item: QListWidgetItem):
+        key = item.data(Qt.UserRole)
+        cur_val = self._initial_state.has_clue(key)
+        items = ["✓ 已获得（True）", "✗ 未获得（False）"]
+        choice, ok = QInputDialog.getItem(
+            self, "编辑线索", f"选择线索「{key}」的状态：",
+            items, 0 if cur_val else 1, False
+        )
+        if ok:
+            new_val = choice.startswith("✓")
+            self._initial_state.add_clue(key, new_val)
+            self._refresh_initial_state_editor()
+            self.data_changed.emit()
+
+    def _del_initial_clue(self):
+        row = self.lst_initial_clues.currentRow()
+        if row < 0:
+            return
+        key = self.lst_initial_clues.item(row).data(Qt.UserRole)
+        del self._initial_state.clues[key]
+        self._refresh_initial_state_editor()
+        self.data_changed.emit()
+
+    def _add_initial_character(self):
+        name, ok = QInputDialog.getText(self, "添加初始角色", "角色ID（如 护士_林）：")
+        if not ok or not name.strip():
+            return
+        name = name.strip()
+        items = ["存活", "死亡", "失踪", "发疯"]
+        choice, ok2 = QInputDialog.getItem(
+            self, "角色初始状态", f"选择角色「{name}」的初始状态：",
+            items, 0, False
+        )
+        if ok2:
+            from models import CharacterStatus
+            status_map = {"存活": CharacterStatus.ALIVE, "死亡": CharacterStatus.DEAD,
+                         "失踪": CharacterStatus.MISSING, "发疯": CharacterStatus.INSANE}
+            self._initial_state.set_character_status(name, status_map[choice])
+            self._refresh_initial_state_editor()
+            self.data_changed.emit()
+
+    def _edit_initial_char(self, item: QListWidgetItem):
+        from models import CharacterStatus
+        key = item.data(Qt.UserRole)
+        cur_val = self._initial_state.get_character_status(key)
+        items = ["存活", "死亡", "失踪", "发疯"]
+        status_map = {"存活": CharacterStatus.ALIVE, "死亡": CharacterStatus.DEAD,
+                     "失踪": CharacterStatus.MISSING, "发疯": CharacterStatus.INSANE}
+        rev_map = {v: k for k, v in status_map.items()}
+        cur_idx = items.index(rev_map.get(cur_val, "存活"))
+        choice, ok = QInputDialog.getItem(
+            self, "编辑角色状态", f"选择角色「{key}」的状态：",
+            items, cur_idx, False
+        )
+        if ok:
+            self._initial_state.set_character_status(key, status_map[choice])
+            self._refresh_initial_state_editor()
+            self.data_changed.emit()
+
+    def _del_initial_char(self):
+        row = self.lst_initial_chars.currentRow()
+        if row < 0:
+            return
+        key = self.lst_initial_chars.item(row).data(Qt.UserRole)
+        del self._initial_state.characters[key]
+        self._refresh_initial_state_editor()
+        self.data_changed.emit()
 
     def _build_event_editor(self):
         gb_base = QGroupBox("📝 事件基本信息")
@@ -184,14 +409,20 @@ class EventInputPanel(QWidget):
         ]:
             w.setEnabled(enabled)
 
-    def set_data(self, events: List[Event], endings: List[Ending]):
+    def set_data(self, events: List[Event], endings: List[Ending], initial_state: Optional[GameState] = None):
         self._events = events
         self._endings = endings
+        if initial_state is not None:
+            self._initial_state = initial_state
         self._current_event = None
         self._refresh_event_tree()
+        self._refresh_initial_state_editor()
 
     def get_events(self) -> List[Event]:
         return self._events
+
+    def get_initial_state(self) -> GameState:
+        return self._initial_state
 
     def _refresh_event_tree(self):
         self.tree_events.clear()
