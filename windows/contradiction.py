@@ -280,11 +280,6 @@ class ContradictionPanel(QWidget):
             return
         validator = CausalityValidator(self._events, self._endings, self._initial_state)
         self._results_cache = validator.validate_all_endings(self._initial_state)
-        for eid, res in self._results_cache.items():
-            ending = next((e for e in self._endings if e.id == eid), None)
-            if ending:
-                extra = validator.find_dialogue_contradictions(res, ending)
-                res.contradictions.extend(extra)
         self._refresh_list()
         self._refresh_report()
         self._update_health()
@@ -292,16 +287,36 @@ class ContradictionPanel(QWidget):
         self.btn_export2.setEnabled(True)
 
     def _collect_all_issues(self) -> List[tuple]:
-        all_issues: List[tuple] = []
+        raw_issues: List[tuple] = []
         for eid, res in self._results_cache.items():
             ending = next((e for e in self._endings if e.id == eid), None)
             title = ending.title if ending else "(未知结局)"
             for c in res.contradictions:
                 if c.severity == "warning" and not self.chk_show_warnings.isChecked():
                     continue
-                all_issues.append((title, c))
-        all_issues.sort(key=lambda x: 0 if x[1].severity == "error" else 1)
-        return all_issues
+                raw_issues.append((title, c))
+
+        merged_map: Dict[str, Contradiction] = {}
+        ending_of_issue: Dict[str, str] = {}
+        for title, c in raw_issues:
+            key = c.compute_dedup_key()
+            if key in merged_map:
+                existing = merged_map[key]
+                existing.occurrence_count += c.occurrence_count
+                for dlg in c.merged_dialogues:
+                    if dlg not in existing.merged_dialogues:
+                        existing.merged_dialogues.append(dlg)
+                if c.dialogue_ref and c.dialogue_ref not in existing.merged_dialogues:
+                    existing.merged_dialogues.append(c.dialogue_ref)
+            else:
+                merged_map[key] = c
+                ending_of_issue[key] = title
+
+        result: List[tuple] = []
+        for key, c in merged_map.items():
+            result.append((ending_of_issue.get(key, "(未知结局)"), c))
+        result.sort(key=lambda x: 0 if x[1].severity == "error" else 1)
+        return result
 
     def _refresh_list(self):
         self.tree_issues.clear()
@@ -428,13 +443,9 @@ class ContradictionPanel(QWidget):
     def _build_report_by_clue(self, all_issues: List[tuple]):
         by_clue: Dict[str, List[tuple]] = {}
         for ending_title, c in all_issues:
-            if c.category == "台词线索缺失" and c.dialogue_ref:
+            if c.category in ("台词线索缺失", "结局条件缺失"):
                 for ref in self._extract_refs_from_issue(c):
-                    if ref.reference_type == "clue":
-                        by_clue.setdefault(ref.reference, []).append((ending_title, c))
-            elif c.category == "结局条件缺失" and c.message and "线索" in c.message:
-                for ref in self._extract_refs_from_issue(c):
-                    if ref.reference_type == "clue":
+                    if hasattr(ref, 'reference_type') and ref.reference_type == "clue" and ref.reference:
                         by_clue.setdefault(ref.reference, []).append((ending_title, c))
 
         for clue_name in sorted(by_clue.keys()):
@@ -462,13 +473,9 @@ class ContradictionPanel(QWidget):
     def _build_report_by_character(self, all_issues: List[tuple]):
         by_char: Dict[str, List[tuple]] = {}
         for ending_title, c in all_issues:
-            if c.category == "台词角色矛盾" and c.dialogue_ref:
+            if c.category in ("台词角色矛盾", "结局条件缺失"):
                 for ref in self._extract_refs_from_issue(c):
-                    if ref.reference_type == "character":
-                        by_char.setdefault(ref.reference, []).append((ending_title, c))
-            elif c.category == "结局条件缺失" and c.message and any(kw in c.message for kw in ["角色", "存活", "死亡", "失踪", "发疯"]):
-                for ref in self._extract_refs_from_issue(c):
-                    if ref.reference_type == "character":
+                    if hasattr(ref, 'reference_type') and ref.reference_type == "character" and ref.reference:
                         by_char.setdefault(ref.reference, []).append((ending_title, c))
 
         for char_name in sorted(by_char.keys()):
@@ -510,8 +517,34 @@ class ContradictionPanel(QWidget):
     def _extract_refs_from_issue(self, c: Contradiction) -> list:
         if not hasattr(self, "_analyzer"):
             self._analyzer = CausalityValidator(self._events, self._endings, self._initial_state)
-        text = c.message + " " + (c.dialogue_ref or "") + " " + c.suggestion
-        return self._analyzer._dialogue_analyzer.extract_references(text)
+        text_parts = [c.message, c.suggestion]
+        if c.dialogue_ref:
+            text_parts.append(c.dialogue_ref)
+        text_parts.extend(c.merged_dialogues)
+        text = " ".join(text_parts)
+        refs = self._analyzer._dialogue_analyzer.extract_references(text)
+        if c.category == "结局条件缺失":
+            for cond in self._get_all_conditions():
+                if cond.id == c.related_condition_id or cond.human_readable() in c.message:
+                    if cond.condition_type.value.startswith("has_clue") or cond.condition_type.value.startswith("no_clue"):
+                        refs.append(type("R", (), {
+                            "reference_type": "clue",
+                            "reference": cond.target or "",
+                        })())
+                    if cond.condition_type.value.startswith("char_"):
+                        refs.append(type("R", (), {
+                            "reference_type": "character",
+                            "reference": cond.target or "",
+                        })())
+        return refs
+
+    def _get_all_conditions(self) -> list:
+        conds = []
+        for e in self._endings:
+            conds.extend(e.conditions)
+        for ev in self._events:
+            conds.extend(ev.conditions)
+        return conds
 
     def _on_select_issue(self):
         items = self.tree_issues.selectedItems()
@@ -773,9 +806,9 @@ class ContradictionPanel(QWidget):
             lines.append("")
             by_clue: Dict[str, List[tuple]] = {}
             for title, c in all_issues:
-                if c.category == "台词线索缺失":
+                if c.category in ("台词线索缺失", "结局条件缺失"):
                     for ref in self._extract_refs_from_issue(c):
-                        if ref.reference_type == "clue":
+                        if hasattr(ref, 'reference_type') and ref.reference_type == "clue" and ref.reference:
                             by_clue.setdefault(ref.reference, []).append((title, c))
             for clue_name in sorted(by_clue.keys()):
                 lines.append("### 线索「{0}」".format(clue_name))
@@ -788,9 +821,9 @@ class ContradictionPanel(QWidget):
             lines.append("")
             by_char: Dict[str, List[tuple]] = {}
             for title, c in all_issues:
-                if c.category == "台词角色矛盾":
+                if c.category in ("台词角色矛盾", "结局条件缺失"):
                     for ref in self._extract_refs_from_issue(c):
-                        if ref.reference_type == "character":
+                        if hasattr(ref, 'reference_type') and ref.reference_type == "character" and ref.reference:
                             by_char.setdefault(ref.reference, []).append((title, c))
             for char_name in sorted(by_char.keys()):
                 lines.append("### 角色「{0}」".format(char_name))
@@ -804,9 +837,9 @@ class ContradictionPanel(QWidget):
             lines.append("=" * 60)
             by_clue: Dict[str, List[tuple]] = {}
             for title, c in all_issues:
-                if c.category == "台词线索缺失":
+                if c.category in ("台词线索缺失", "结局条件缺失"):
                     for ref in self._extract_refs_from_issue(c):
-                        if ref.reference_type == "clue":
+                        if hasattr(ref, 'reference_type') and ref.reference_type == "clue" and ref.reference:
                             by_clue.setdefault(ref.reference, []).append((title, c))
             for clue_name in sorted(by_clue.keys()):
                 lines.append("")
@@ -820,9 +853,9 @@ class ContradictionPanel(QWidget):
             lines.append("=" * 60)
             by_char: Dict[str, List[tuple]] = {}
             for title, c in all_issues:
-                if c.category == "台词角色矛盾":
+                if c.category in ("台词角色矛盾", "结局条件缺失"):
                     for ref in self._extract_refs_from_issue(c):
-                        if ref.reference_type == "character":
+                        if hasattr(ref, 'reference_type') and ref.reference_type == "character" and ref.reference:
                             by_char.setdefault(ref.reference, []).append((title, c))
             for char_name in sorted(by_char.keys()):
                 lines.append("")
@@ -853,7 +886,10 @@ class ContradictionPanel(QWidget):
                 parts.append("  - 相关结局：{0}".format(ending_title))
             if c.related_chapter:
                 parts.append("  - 建议章节：第 {0} 章".format(c.related_chapter))
-            if c.dialogue_ref:
+            if c.merged_dialogues and len(c.merged_dialogues) > 1:
+                for i, dlg in enumerate(c.merged_dialogues):
+                    parts.append("  - 相关台词{0}：「{1}」".format(i + 1, dlg))
+            elif c.dialogue_ref:
                 parts.append("  - 相关台词：「{0}」".format(c.dialogue_ref))
             parts.append("  - 修改建议：{0}".format(c.suggestion))
             return "\n".join(parts)
@@ -865,7 +901,10 @@ class ContradictionPanel(QWidget):
                 parts.append("     相关结局：{0}".format(ending_title))
             if c.related_chapter:
                 parts.append("     建议章节：第 {0} 章".format(c.related_chapter))
-            if c.dialogue_ref:
+            if c.merged_dialogues and len(c.merged_dialogues) > 1:
+                for i, dlg in enumerate(c.merged_dialogues):
+                    parts.append("     相关台词{0}：「{1}」".format(i + 1, dlg))
+            elif c.dialogue_ref:
                 parts.append("     相关台词：「{0}」".format(c.dialogue_ref))
             parts.append("     修改建议：{0}".format(c.suggestion))
             return "\n".join(parts)

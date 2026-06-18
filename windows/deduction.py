@@ -563,8 +563,6 @@ class EndingDeductionPanel(QWidget):
             return
         validator = CausalityValidator(self._events, self._endings, self._initial_state)
         result = validator.simulate_path_to_ending(self._current_ending, self._initial_state)
-        extra = validator.find_dialogue_contradictions(result, self._current_ending)
-        result.contradictions.extend(extra)
         self._current_result = result
         self._render_result(result)
 
@@ -808,7 +806,29 @@ class EndingDeductionPanel(QWidget):
 
     def _on_missing_double_click(self, item: QListWidgetItem):
         raw = item.data(Qt.UserRole)
-        if raw and isinstance(raw, tuple) and len(raw) >= 3:
-            tag, cond_id, ending_id = raw[0], raw[1], raw[2]
+        if not raw or not isinstance(raw, tuple) or len(raw) < 3:
+            return
+        tag, cond_id, ending_id = raw[0], raw[1], raw[2]
+        if not self._current_ending or not self._current_result:
             if ending_id:
                 self.navigate_ending_requested.emit(ending_id)
+            return
+
+        target_cond = None
+        for c in self._current_ending.conditions:
+            if c.id == cond_id or c.human_readable() == item.text():
+                target_cond = c
+                break
+        if target_cond is None:
+            if ending_id:
+                self.navigate_ending_requested.emit(ending_id)
+            return
+
+        validator = CausalityValidator(self._events, self._endings, self._initial_state)
+        best_event, best_chapter, best_choice = validator._find_best_event_for_condition(
+            target_cond, self._current_result.timeline
+        )
+        if best_event:
+            self.navigate_event_requested.emit(best_event.id)
+        elif ending_id:
+            self.navigate_ending_requested.emit(ending_id)
