@@ -5,19 +5,21 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from typing import List, Optional, Dict, Set
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QTreeWidget,
-    QTreeWidgetItem, QComboBox, QLineEdit, QTextEdit,
-    QListWidget, QListWidgetItem, QMessageBox,
+    QTreeWidgetItem, QComboBox, QLineEdit, QTextEdit, QCheckBox,
+    QFormLayout, QListWidget, QListWidgetItem, QMessageBox,
     QGroupBox, QScrollArea, QSplitter, QFrame, QTabWidget,
-    QSizePolicy, QCheckBox, QHeaderView, QTableWidget, QTableWidgetItem,
-    QAbstractItemView,
+    QProgressBar, QSizePolicy, QDialog, QDialogButtonBox, QHeaderView,
+    QTableWidget, QTableWidgetItem, QAbstractItemView, QFileDialog,
 )
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QFont, QColor, QBrush
 
-from models import Event, Ending, Condition, GameState
+from models import (
+    Event, Ending, Condition, GameState, CharacterStatus,
+)
 from services.validator import (
     CausalityValidator, ValidationResult, LinkStatus, Contradiction,
-    BranchPreview,
+    BranchPreview, FullBranchResult,
 )
 from .common import (
     apply_dark_style, COLOR_BROKEN, COLOR_VALID, COLOR_WARN, COLOR_INFO,
@@ -54,6 +56,11 @@ class ContradictionPanel(QWidget):
         self.chk_show_warnings.setChecked(True)
         self.chk_show_warnings.stateChanged.connect(self._refresh_list)
         th.addWidget(self.chk_show_warnings)
+
+        self.btn_export = QPushButton("📤 导出审稿报告")
+        self.btn_export.clicked.connect(self._export_report)
+        self.btn_export.setEnabled(False)
+        th.addWidget(self.btn_export)
 
         self.btn_check_all = QPushButton("🔎 全结局一键校验")
         self.btn_check_all.clicked.connect(self._check_all_endings)
@@ -141,20 +148,88 @@ class ContradictionPanel(QWidget):
         tr_layout = QVBoxLayout(tab_report)
         tr_layout.setContentsMargins(0, 0, 0, 0)
 
-        report_header = QLabel("📝 审稿报告（按类别归档，双击跳转定位）")
-        report_header.setFont(QFont("Microsoft YaHei", 10, QFont.Bold))
-        report_header.setStyleSheet("color: #aaa; padding: 4px;")
+        report_header = QFrame()
+        rh = QHBoxLayout(report_header)
+        rh.setContentsMargins(0, 0, 0, 0)
+        rh.addWidget(QLabel("📝 复盘看板"))
+        rh.addStretch()
+        rh.addWidget(QLabel("按维度分组："))
+        self.cmb_report_dimension = QComboBox()
+        self.cmb_report_dimension.addItems(["🎬 按结局", "📖 按章节", "🔍 按线索", "👥 按角色"])
+        self.cmb_report_dimension.currentIndexChanged.connect(self._refresh_report)
+        rh.addWidget(self.cmb_report_dimension)
+        self.btn_export2 = QPushButton("📤 导出")
+        self.btn_export2.clicked.connect(self._export_report)
+        self.btn_export2.setEnabled(False)
+        rh.addWidget(self.btn_export2)
         tr_layout.addWidget(report_header)
 
-        self.tree_report = QTreeWidget()
-        self.tree_report.setHeaderLabels(["分类维度", "问题摘要", "关联台词/补写位置"])
-        self.tree_report.header().setStretchLastSection(True)
-        self.tree_report.header().setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        self.tree_report.header().setSectionResizeMode(1, QHeaderView.Stretch)
-        self.tree_report.itemDoubleClicked.connect(self._on_report_double_click)
-        tr_layout.addWidget(self.tree_report, 1)
+        report_body = QSplitter(Qt.Horizontal)
 
-        self.tabs_view.addTab(tab_report, "📝 审稿报告")
+        report_left = QFrame()
+        rlv = QVBoxLayout(report_left)
+        rlv.setContentsMargins(0, 0, 0, 0)
+        head_ll = QLabel("分组目录（点击查看详情）")
+        head_ll.setFont(QFont("Microsoft YaHei", 10, QFont.Bold))
+        head_ll.setStyleSheet("color: #aaa; padding: 4px;")
+        rlv.addWidget(head_ll)
+
+        self.tree_report = QTreeWidget()
+        self.tree_report.setHeaderLabels(["分组", "问题数", "严重程度"])
+        self.tree_report.header().setStretchLastSection(True)
+        self.tree_report.header().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.tree_report.header().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.tree_report.itemSelectionChanged.connect(self._on_report_select)
+        self.tree_report.itemDoubleClicked.connect(self._on_report_double_click)
+        rlv.addWidget(self.tree_report, 1)
+        report_body.addWidget(report_left)
+
+        report_right = QFrame()
+        rrv = QVBoxLayout(report_right)
+        rrv.setContentsMargins(0, 0, 0, 0)
+        head_rr = QLabel("📋 问题详情")
+        head_rr.setFont(QFont("Microsoft YaHei", 10, QFont.Bold))
+        head_rr.setStyleSheet("color: #aaa; padding: 4px;")
+        rrv.addWidget(head_rr)
+
+        self.report_issue_list = QListWidget()
+        self.report_issue_list.itemSelectionChanged.connect(self._on_report_issue_select)
+        self.report_issue_list.itemDoubleClicked.connect(self._on_report_issue_double_click)
+        rrv.addWidget(self.report_issue_list, 1)
+
+        self.report_detail = QTextEdit()
+        self.report_detail.setReadOnly(True)
+        self.report_detail.setStyleSheet("""
+            QTextEdit {
+                background-color: #2a2a35;
+                border: 1px solid #44445a;
+                border-radius: 4px;
+                padding: 10px;
+                color: #ddd;
+                font-size: 14px;
+                line-height: 1.6;
+            }
+        """)
+        rrv.addWidget(self.report_detail, 2)
+
+        btn_row = QHBoxLayout()
+        self.btn_report_goto = QPushButton("📍 跳转到修改位置")
+        self.btn_report_goto.clicked.connect(self._goto_current_report_issue)
+        self.btn_report_goto.setEnabled(False)
+        self.btn_report_copy = QPushButton("📋 复制建议")
+        self.btn_report_copy.clicked.connect(self._copy_report_suggestion)
+        self.btn_report_copy.setEnabled(False)
+        btn_row.addWidget(self.btn_report_goto)
+        btn_row.addStretch()
+        btn_row.addWidget(self.btn_report_copy)
+        rrv.addLayout(btn_row)
+
+        report_body.addWidget(report_right)
+        report_body.setStretchFactor(0, 1)
+        report_body.setStretchFactor(1, 2)
+        tr_layout.addWidget(report_body, 1)
+
+        self.tabs_view.addTab(tab_report, "📝 复盘看板")
 
         root.addWidget(self.tabs_view, 1)
 
@@ -176,6 +251,7 @@ class ContradictionPanel(QWidget):
         root.addWidget(gb)
 
         self._current_issue: Optional[Contradiction] = None
+        self._current_report_issue: Optional[Contradiction] = None
 
     def set_data(self, events: List[Event], endings: List[Ending], initial_state: Optional[GameState] = None):
         self._events = events
@@ -185,10 +261,14 @@ class ContradictionPanel(QWidget):
         self._results_cache.clear()
         self.tree_issues.clear()
         self.tree_report.clear()
+        self.report_issue_list.clear()
         self.ed_detail.clear()
+        self.report_detail.clear()
         self.lbl_stats.setText("尚未开始校验")
         self.lbl_health.setText("数据已更新，请重新点击「全结局一键校验」。")
         self.txt_health_tips.clear()
+        self.btn_export.setEnabled(False)
+        self.btn_export2.setEnabled(False)
 
     def set_cached_result(self, ending: Ending, result: ValidationResult):
         self._results_cache[ending.id] = result
@@ -208,6 +288,8 @@ class ContradictionPanel(QWidget):
         self._refresh_list()
         self._refresh_report()
         self._update_health()
+        self.btn_export.setEnabled(True)
+        self.btn_export2.setEnabled(True)
 
     def _collect_all_issues(self) -> List[tuple]:
         all_issues: List[tuple] = []
@@ -247,7 +329,12 @@ class ContradictionPanel(QWidget):
 
             for c in issues:
                 sev = "❌ 错误" if c.severity == "error" else "⚠ 警告"
-                sub = QTreeWidgetItem([sev, c.category, c.message[:80] + ("..." if len(c.message) > 80 else "")])
+                occ_text = " (x{0})".format(c.occurrence_count) if c.occurrence_count > 1 else ""
+                sub = QTreeWidgetItem([
+                    sev,
+                    c.category + occ_text,
+                    c.message[:80] + ("..." if len(c.message) > 80 else ""),
+                ])
                 sub.setData(0, Qt.UserRole, c)
                 sc = COLOR_BROKEN if c.severity == "error" else COLOR_WARN
                 sub.setForeground(0, QBrush(sc))
@@ -265,103 +352,166 @@ class ContradictionPanel(QWidget):
 
     def _refresh_report(self):
         self.tree_report.clear()
+        self.report_issue_list.clear()
+        self.report_detail.clear()
         all_issues = self._collect_all_issues()
+        if not all_issues:
+            return
 
-        by_category: Dict[str, List[tuple]] = {}
+        dim = self.cmb_report_dimension.currentIndex()
+
+        if dim == 0:
+            self._build_report_by_ending(all_issues)
+        elif dim == 1:
+            self._build_report_by_chapter(all_issues)
+        elif dim == 2:
+            self._build_report_by_clue(all_issues)
+        else:
+            self._build_report_by_character(all_issues)
+
+        self.tree_report.expandAll()
+
+    def _build_report_by_ending(self, all_issues: List[tuple]):
+        by_ending: Dict[str, List[Contradiction]] = {}
         for ending_title, c in all_issues:
-            by_category.setdefault(c.category, []).append((ending_title, c))
+            by_ending.setdefault(ending_title, []).append(c)
 
-        cat_order = ["事件条件冲突", "结局条件缺失", "台词线索缺失", "台词角色矛盾", "台词地点缺失"]
-        for cat in cat_order:
-            if cat not in by_category:
-                continue
-            issues = by_category[cat]
-            errors = sum(1 for _, c in issues if c.severity == "error")
+        for ending_title in sorted(by_ending.keys()):
+            issues = by_ending[ending_title]
+            errors = sum(1 for c in issues if c.severity == "error")
             warns = len(issues) - errors
-            cat_item = QTreeWidgetItem([
-                "{0} ({1})".format(cat, len(issues)),
-                "{0} 严重 / {1} 警告".format(errors, warns),
-                "",
+            top = QTreeWidgetItem([
+                "🎬 {0}".format(ending_title),
+                str(len(issues)),
+                "❌{0} ⚠{1}".format(errors, warns) if errors > 0 else "⚠{0}".format(warns),
             ])
-            cat_color = COLOR_BROKEN if errors else COLOR_WARN
-            cat_item.setForeground(0, QBrush(cat_color))
-            f = QFont(); f.setBold(True); cat_item.setFont(0, f)
-            self.tree_report.addTopLevelItem(cat_item)
+            color = COLOR_BROKEN if errors else (COLOR_WARN if warns else COLOR_VALID)
+            top.setForeground(0, QBrush(color))
+            top.setForeground(2, QBrush(color))
+            f = QFont(); f.setBold(True); top.setFont(0, f)
+            top.setData(0, Qt.UserRole, ("group", "ending", ending_title, issues))
+            self.tree_report.addTopLevelItem(top)
 
-            by_ending: Dict[str, List[tuple]] = {}
-            for ending_title, c in issues:
-                by_ending.setdefault(ending_title, []).append(c)
+            for c in issues:
+                sub = self._make_report_issue_item(c)
+                top.addChild(sub)
 
-            for ending_title, ending_issues in by_ending.items():
-                end_item = QTreeWidgetItem([
-                    "🎬 " + ending_title,
-                    "{0} 个问题".format(len(ending_issues)),
-                    "",
-                ])
-                end_item.setForeground(0, QBrush(COLOR_INFO))
-                cat_item.addChild(end_item)
-
-                for c in ending_issues:
-                    dialogue_hint = ""
-                    if c.dialogue_ref:
-                        dialogue_hint = "台词: {0}".format(c.dialogue_ref[:50])
-                    chapter_hint = ""
-                    if c.related_chapter:
-                        chapter_hint = "→ 第{0}章补写".format(c.related_chapter)
-
-                    sub = QTreeWidgetItem([
-                        "❌" if c.severity == "error" else "⚠",
-                        c.message[:80],
-                        "{0} {1}".format(dialogue_hint, chapter_hint).strip(),
-                    ])
-                    sub.setData(0, Qt.UserRole, c)
-                    sc = COLOR_BROKEN if c.severity == "error" else COLOR_WARN
-                    sub.setForeground(0, QBrush(sc))
-                    sub.setForeground(1, QBrush(QColor(220, 220, 220)))
-                    if c.dialogue_ref:
-                        sub.setForeground(2, QBrush(QColor(255, 200, 150)))
-                    else:
-                        sub.setForeground(2, QBrush(COLOR_VALID))
-                    end_item.addChild(sub)
-
+    def _build_report_by_chapter(self, all_issues: List[tuple]):
         by_chapter: Dict[int, List[tuple]] = {}
         for ending_title, c in all_issues:
             ch = c.related_chapter or 0
             by_chapter.setdefault(ch, []).append((ending_title, c))
 
-        if by_chapter:
-            chap_root = QTreeWidgetItem([
-                "📖 按章节归档 ({0} 章)".format(len(by_chapter)),
-                "",
-                "",
+        for ch_num in sorted(by_chapter.keys()):
+            issues_with_title = by_chapter[ch_num]
+            issues = [c for _, c in issues_with_title]
+            errors = sum(1 for c in issues if c.severity == "error")
+            warns = len(issues) - errors
+            label = "第 {0} 章".format(ch_num) if ch_num > 0 else "未指定章节"
+            top = QTreeWidgetItem([
+                "📖 {0}".format(label),
+                str(len(issues)),
+                "❌{0} ⚠{1}".format(errors, warns) if errors > 0 else "⚠{0}".format(warns),
             ])
-            chap_root.setForeground(0, QBrush(COLOR_INFO))
-            f2 = QFont(); f2.setBold(True); chap_root.setFont(0, f2)
-            self.tree_report.addTopLevelItem(chap_root)
+            color = COLOR_BROKEN if errors else (COLOR_WARN if warns else COLOR_VALID)
+            top.setForeground(0, QBrush(color))
+            top.setForeground(2, QBrush(color))
+            f = QFont(); f.setBold(True); top.setFont(0, f)
+            top.setData(0, Qt.UserRole, ("group", "chapter", str(ch_num), issues))
+            self.tree_report.addTopLevelItem(top)
 
-            for ch_num in sorted(by_chapter.keys()):
-                ch_issues = by_chapter[ch_num]
-                ch_label = "第 {0} 章".format(ch_num) if ch_num > 0 else "未指定章节"
-                ch_item = QTreeWidgetItem([
-                    ch_label,
-                    "{0} 个问题".format(len(ch_issues)),
-                    "",
-                ])
-                chap_root.addChild(ch_item)
-                for ending_title, c in ch_issues:
-                    sub = QTreeWidgetItem([
-                        "❌" if c.severity == "error" else "⚠",
-                        "[{0}] {1}".format(ending_title, c.message[:60]),
-                        c.category,
-                    ])
-                    sub.setData(0, Qt.UserRole, c)
-                    sc = COLOR_BROKEN if c.severity == "error" else COLOR_WARN
-                    sub.setForeground(0, QBrush(sc))
-                    ch_item.addChild(sub)
+            for ending_title, c in issues_with_title:
+                sub = self._make_report_issue_item(c)
+                sub.setText(2, "[{0}] {1}".format(ending_title, sub.text(2)))
+                top.addChild(sub)
 
-        self.tree_report.expandAll()
-        for i in range(3):
-            self.tree_report.resizeColumnToContents(i)
+    def _build_report_by_clue(self, all_issues: List[tuple]):
+        by_clue: Dict[str, List[tuple]] = {}
+        for ending_title, c in all_issues:
+            if c.category == "台词线索缺失" and c.dialogue_ref:
+                for ref in self._extract_refs_from_issue(c):
+                    if ref.reference_type == "clue":
+                        by_clue.setdefault(ref.reference, []).append((ending_title, c))
+            elif c.category == "结局条件缺失" and c.message and "线索" in c.message:
+                for ref in self._extract_refs_from_issue(c):
+                    if ref.reference_type == "clue":
+                        by_clue.setdefault(ref.reference, []).append((ending_title, c))
+
+        for clue_name in sorted(by_clue.keys()):
+            issues_with_title = by_clue[clue_name]
+            issues = [c for _, c in issues_with_title]
+            errors = sum(1 for c in issues if c.severity == "error")
+            warns = len(issues) - errors
+            top = QTreeWidgetItem([
+                "🔍 线索「{0}」".format(clue_name),
+                str(len(issues)),
+                "❌{0} ⚠{1}".format(errors, warns) if errors > 0 else "⚠{0}".format(warns),
+            ])
+            color = COLOR_BROKEN if errors else (COLOR_WARN if warns else COLOR_VALID)
+            top.setForeground(0, QBrush(color))
+            top.setForeground(2, QBrush(color))
+            f = QFont(); f.setBold(True); top.setFont(0, f)
+            top.setData(0, Qt.UserRole, ("group", "clue", clue_name, issues))
+            self.tree_report.addTopLevelItem(top)
+
+            for ending_title, c in issues_with_title:
+                sub = self._make_report_issue_item(c)
+                sub.setText(2, "[{0}] {1}".format(ending_title, sub.text(2)))
+                top.addChild(sub)
+
+    def _build_report_by_character(self, all_issues: List[tuple]):
+        by_char: Dict[str, List[tuple]] = {}
+        for ending_title, c in all_issues:
+            if c.category == "台词角色矛盾" and c.dialogue_ref:
+                for ref in self._extract_refs_from_issue(c):
+                    if ref.reference_type == "character":
+                        by_char.setdefault(ref.reference, []).append((ending_title, c))
+            elif c.category == "结局条件缺失" and c.message and any(kw in c.message for kw in ["角色", "存活", "死亡", "失踪", "发疯"]):
+                for ref in self._extract_refs_from_issue(c):
+                    if ref.reference_type == "character":
+                        by_char.setdefault(ref.reference, []).append((ending_title, c))
+
+        for char_name in sorted(by_char.keys()):
+            issues_with_title = by_char[char_name]
+            issues = [c for _, c in issues_with_title]
+            errors = sum(1 for c in issues if c.severity == "error")
+            warns = len(issues) - errors
+            top = QTreeWidgetItem([
+                "👥 角色「{0}」".format(char_name),
+                str(len(issues)),
+                "❌{0} ⚠{1}".format(errors, warns) if errors > 0 else "⚠{0}".format(warns),
+            ])
+            color = COLOR_BROKEN if errors else (COLOR_WARN if warns else COLOR_VALID)
+            top.setForeground(0, QBrush(color))
+            top.setForeground(2, QBrush(color))
+            f = QFont(); f.setBold(True); top.setFont(0, f)
+            top.setData(0, Qt.UserRole, ("group", "character", char_name, issues))
+            self.tree_report.addTopLevelItem(top)
+
+            for ending_title, c in issues_with_title:
+                sub = self._make_report_issue_item(c)
+                sub.setText(2, "[{0}] {1}".format(ending_title, sub.text(2)))
+                top.addChild(sub)
+
+    def _make_report_issue_item(self, c: Contradiction) -> QTreeWidgetItem:
+        sev = "❌" if c.severity == "error" else "⚠"
+        occ_text = " (x{0})".format(c.occurrence_count) if c.occurrence_count > 1 else ""
+        item = QTreeWidgetItem([
+            sev,
+            c.category + occ_text,
+            c.message[:60],
+        ])
+        item.setData(0, Qt.UserRole, ("issue", c))
+        sc = COLOR_BROKEN if c.severity == "error" else COLOR_WARN
+        item.setForeground(0, QBrush(sc))
+        item.setForeground(2, QBrush(QColor(220, 220, 220)))
+        return item
+
+    def _extract_refs_from_issue(self, c: Contradiction) -> list:
+        if not hasattr(self, "_analyzer"):
+            self._analyzer = CausalityValidator(self._events, self._endings, self._initial_state)
+        text = c.message + " " + (c.dialogue_ref or "") + " " + c.suggestion
+        return self._analyzer._dialogue_analyzer.extract_references(text)
 
     def _on_select_issue(self):
         items = self.tree_issues.selectedItems()
@@ -387,11 +537,63 @@ class ContradictionPanel(QWidget):
             return
         self._navigate_to_issue(issue)
 
-    def _on_report_double_click(self, item: QTreeWidgetItem, col: int):
-        issue: Optional[Contradiction] = item.data(0, Qt.UserRole)
-        if issue is None:
+    def _on_report_select(self):
+        items = self.tree_report.selectedItems()
+        self.report_issue_list.clear()
+        if not items:
             return
-        self._navigate_to_issue(issue)
+        data = items[0].data(0, Qt.UserRole)
+        if data and isinstance(data, tuple) and len(data) >= 4:
+            issues = data[3]
+            for c in issues:
+                sev = "❌" if c.severity == "error" else "⚠"
+                occ_text = " (x{0})".format(c.occurrence_count) if c.occurrence_count > 1 else ""
+                item = QListWidgetItem("{0} {1}{2}：{3}".format(
+                    sev, c.category, occ_text, c.message[:60]
+                ))
+                item.setData(Qt.UserRole, c)
+                if c.severity == "error":
+                    item.setForeground(QBrush(COLOR_BROKEN))
+                else:
+                    item.setForeground(QBrush(COLOR_WARN))
+                self.report_issue_list.addItem(item)
+
+    def _on_report_issue_select(self):
+        items = self.report_issue_list.selectedItems()
+        if not items:
+            self._current_report_issue = None
+            self.report_detail.clear()
+            self.btn_report_goto.setEnabled(False)
+            self.btn_report_copy.setEnabled(False)
+            return
+        issue = items[0].data(Qt.UserRole)
+        self._current_report_issue = issue
+        self.report_detail.setHtml(self._render_issue_detail(issue))
+        self.btn_report_goto.setEnabled(True)
+        self.btn_report_copy.setEnabled(True)
+
+    def _on_report_double_click(self, item: QTreeWidgetItem, col: int):
+        data = item.data(0, Qt.UserRole)
+        if data and isinstance(data, tuple) and len(data) >= 2:
+            if data[0] == "issue":
+                self._navigate_to_issue(data[1])
+
+    def _on_report_issue_double_click(self, item: QListWidgetItem):
+        issue = item.data(Qt.UserRole)
+        if issue:
+            self._navigate_to_issue(issue)
+
+    def _goto_current_report_issue(self):
+        if self._current_report_issue:
+            self._navigate_to_issue(self._current_report_issue)
+
+    def _copy_report_suggestion(self):
+        if self._current_report_issue:
+            from PySide6.QtWidgets import QApplication
+            QApplication.clipboard().setText(self._current_report_issue.suggestion)
+            self.btn_report_copy.setText("✅ 已复制！")
+            from PySide6.QtCore import QTimer
+            QTimer.singleShot(1500, lambda: self.btn_report_copy.setText("📋 复制建议"))
 
     def _navigate_to_issue(self, issue: Contradiction):
         nav_type = issue.nav_target_type
@@ -425,6 +627,248 @@ class ContradictionPanel(QWidget):
             self.btn_copy_suggestion.setText("✅ 已复制！")
             from PySide6.QtCore import QTimer
             QTimer.singleShot(1500, lambda: self.btn_copy_suggestion.setText("📋 复制建议"))
+
+    def _export_report(self):
+        if not self._results_cache:
+            QMessageBox.information(self, "提示", "请先运行校验。")
+            return
+
+        options = QFileDialog.Options()
+        file_name, filter_used = QFileDialog.getSaveFileName(
+            self, "导出审稿报告", "剧本审稿报告.md",
+            "Markdown 文件 (*.md);;纯文本文件 (*.txt);;所有文件 (*.*)",
+            options=options,
+        )
+        if not file_name:
+            return
+
+        is_md = filter_used.startswith("Markdown") or file_name.lower().endswith(".md")
+        report = self._generate_export_report(is_md)
+
+        try:
+            with open(file_name, "w", encoding="utf-8") as f:
+                f.write(report)
+            QMessageBox.information(self, "成功", "审稿报告已导出到：\n{0}".format(file_name))
+        except Exception as e:
+            QMessageBox.critical(self, "导出失败", str(e))
+
+    def _generate_export_report(self, markdown: bool = True) -> str:
+        validator = CausalityValidator(self._events, self._endings, self._initial_state)
+        entities = validator.get_known_entities()
+
+        lines = []
+        if markdown:
+            lines.append("# 剧本因果链审稿报告")
+            lines.append("")
+            lines.append("*生成日期：{0}*".format("2026-06-19"))
+            lines.append("")
+            lines.append("## 剧本概况")
+            lines.append("")
+            lines.append("- **事件总数**：{0}".format(len(self._events)))
+            lines.append("- **结局总数**：{0}".format(len(self._endings)))
+            lines.append("- **涉及线索**：{0} 条".format(len(entities.get("clues", []))))
+            lines.append("- **涉及角色**：{0} 名".format(len(entities.get("characters", []))))
+            lines.append("- **涉及地点**：{0} 处".format(len(entities.get("locations", []))))
+            lines.append("")
+        else:
+            lines.append("=" * 60)
+            lines.append("剧本因果链审稿报告")
+            lines.append("生成日期：2026-06-19")
+            lines.append("=" * 60)
+            lines.append("")
+            lines.append("【剧本概况】")
+            lines.append("  事件总数：{0}".format(len(self._events)))
+            lines.append("  结局总数：{0}".format(len(self._endings)))
+            lines.append("  涉及线索：{0} 条".format(len(entities.get("clues", []))))
+            lines.append("  涉及角色：{0} 名".format(len(entities.get("characters", []))))
+            lines.append("  涉及地点：{0} 处".format(len(entities.get("locations", []))))
+            lines.append("")
+
+        total_errors = 0
+        total_warnings = 0
+        for res in self._results_cache.values():
+            total_errors += sum(1 for c in res.contradictions if c.severity == "error")
+            total_warnings += sum(1 for c in res.contradictions if c.severity == "warning")
+
+        if markdown:
+            lines.append("## 健康度评估")
+            lines.append("")
+            lines.append("- **严重错误**：{0} 处".format(total_errors))
+            lines.append("- **警告提示**：{0} 处".format(total_warnings))
+            health_pct = max(0, 100 - total_errors * 10 - total_warnings * 3)
+            health_level = "优秀" if health_pct >= 80 else ("良好" if health_pct >= 60 else ("待改进" if health_pct >= 40 else "需修复"))
+            lines.append("- **健康评分**：{0}/100（{1}）".format(health_pct, health_level))
+            lines.append("")
+        else:
+            lines.append("【健康度评估】")
+            lines.append("  严重错误：{0} 处".format(total_errors))
+            lines.append("  警告提示：{0} 处".format(total_warnings))
+            health_pct = max(0, 100 - total_errors * 10 - total_warnings * 3)
+            health_level = "优秀" if health_pct >= 80 else ("良好" if health_pct >= 60 else ("待改进" if health_pct >= 40 else "需修复"))
+            lines.append("  健康评分：{0}/100（{1}）".format(health_pct, health_level))
+            lines.append("")
+
+        all_issues = self._collect_all_issues()
+
+        if markdown:
+            lines.append("## 按结局分类问题")
+            lines.append("")
+            by_ending: Dict[str, List[tuple]] = {}
+            for title, c in all_issues:
+                by_ending.setdefault(title, []).append((title, c))
+            for ending_title in sorted(by_ending.keys()):
+                lines.append("### {0}".format(ending_title))
+                lines.append("")
+                issues = by_ending[ending_title]
+                for _, c in issues:
+                    lines.append(self._format_issue(c, markdown))
+                lines.append("")
+        else:
+            lines.append("=" * 60)
+            lines.append("【按结局分类问题】")
+            lines.append("=" * 60)
+            by_ending: Dict[str, List[tuple]] = {}
+            for title, c in all_issues:
+                by_ending.setdefault(title, []).append((title, c))
+            for ending_title in sorted(by_ending.keys()):
+                lines.append("")
+                lines.append("【{0}】".format(ending_title))
+                issues = by_ending[ending_title]
+                for _, c in issues:
+                    lines.append(self._format_issue(c, markdown))
+                lines.append("")
+
+        if markdown:
+            lines.append("## 按章节分类问题")
+            lines.append("")
+            by_chapter: Dict[int, List[tuple]] = {}
+            for title, c in all_issues:
+                ch = c.related_chapter or 0
+                by_chapter.setdefault(ch, []).append((title, c))
+            for ch_num in sorted(by_chapter.keys()):
+                label = "第 {0} 章".format(ch_num) if ch_num > 0 else "未指定章节"
+                lines.append("### {0}".format(label))
+                lines.append("")
+                for title, c in by_chapter[ch_num]:
+                    lines.append(self._format_issue(c, markdown, title))
+                lines.append("")
+        else:
+            lines.append("=" * 60)
+            lines.append("【按章节分类问题】")
+            lines.append("=" * 60)
+            by_chapter: Dict[int, List[tuple]] = {}
+            for title, c in all_issues:
+                ch = c.related_chapter or 0
+                by_chapter.setdefault(ch, []).append((title, c))
+            for ch_num in sorted(by_chapter.keys()):
+                label = "第 {0} 章".format(ch_num) if ch_num > 0 else "未指定章节"
+                lines.append("")
+                lines.append("【{0}】".format(label))
+                for title, c in by_chapter[ch_num]:
+                    lines.append(self._format_issue(c, markdown, title))
+                lines.append("")
+
+        if markdown:
+            lines.append("## 按线索分类问题")
+            lines.append("")
+            by_clue: Dict[str, List[tuple]] = {}
+            for title, c in all_issues:
+                if c.category == "台词线索缺失":
+                    for ref in self._extract_refs_from_issue(c):
+                        if ref.reference_type == "clue":
+                            by_clue.setdefault(ref.reference, []).append((title, c))
+            for clue_name in sorted(by_clue.keys()):
+                lines.append("### 线索「{0}」".format(clue_name))
+                lines.append("")
+                for title, c in by_clue[clue_name]:
+                    lines.append(self._format_issue(c, markdown, title))
+                lines.append("")
+
+            lines.append("## 按角色分类问题")
+            lines.append("")
+            by_char: Dict[str, List[tuple]] = {}
+            for title, c in all_issues:
+                if c.category == "台词角色矛盾":
+                    for ref in self._extract_refs_from_issue(c):
+                        if ref.reference_type == "character":
+                            by_char.setdefault(ref.reference, []).append((title, c))
+            for char_name in sorted(by_char.keys()):
+                lines.append("### 角色「{0}」".format(char_name))
+                lines.append("")
+                for title, c in by_char[char_name]:
+                    lines.append(self._format_issue(c, markdown, title))
+                lines.append("")
+        else:
+            lines.append("=" * 60)
+            lines.append("【按线索分类问题】")
+            lines.append("=" * 60)
+            by_clue: Dict[str, List[tuple]] = {}
+            for title, c in all_issues:
+                if c.category == "台词线索缺失":
+                    for ref in self._extract_refs_from_issue(c):
+                        if ref.reference_type == "clue":
+                            by_clue.setdefault(ref.reference, []).append((title, c))
+            for clue_name in sorted(by_clue.keys()):
+                lines.append("")
+                lines.append("【线索「{0}」】".format(clue_name))
+                for title, c in by_clue[clue_name]:
+                    lines.append(self._format_issue(c, markdown, title))
+                lines.append("")
+
+            lines.append("=" * 60)
+            lines.append("【按角色分类问题】")
+            lines.append("=" * 60)
+            by_char: Dict[str, List[tuple]] = {}
+            for title, c in all_issues:
+                if c.category == "台词角色矛盾":
+                    for ref in self._extract_refs_from_issue(c):
+                        if ref.reference_type == "character":
+                            by_char.setdefault(ref.reference, []).append((title, c))
+            for char_name in sorted(by_char.keys()):
+                lines.append("")
+                lines.append("【角色「{0}」】".format(char_name))
+                for title, c in by_char[char_name]:
+                    lines.append(self._format_issue(c, markdown, title))
+                lines.append("")
+
+        if markdown:
+            lines.append("---")
+            lines.append("*本报告由因果链校验器自动生成*")
+        else:
+            lines.append("=" * 60)
+            lines.append("本报告由因果链校验器自动生成")
+            lines.append("=" * 60)
+
+        return "\n".join(lines)
+
+    def _format_issue(self, c: Contradiction, markdown: bool, ending_title: Optional[str] = None) -> str:
+        sev_icon = "❌" if c.severity == "error" else "⚠"
+        occ_text = " (出现{0}次)".format(c.occurrence_count) if c.occurrence_count > 1 else ""
+
+        if markdown:
+            parts = []
+            parts.append("- {0} **{1}**{2}".format(sev_icon, c.category, occ_text))
+            parts.append("  - 问题：{0}".format(c.message))
+            if ending_title:
+                parts.append("  - 相关结局：{0}".format(ending_title))
+            if c.related_chapter:
+                parts.append("  - 建议章节：第 {0} 章".format(c.related_chapter))
+            if c.dialogue_ref:
+                parts.append("  - 相关台词：「{0}」".format(c.dialogue_ref))
+            parts.append("  - 修改建议：{0}".format(c.suggestion))
+            return "\n".join(parts)
+        else:
+            parts = []
+            parts.append("  {0} {1}{2}".format(sev_icon, c.category, occ_text))
+            parts.append("     问题：{0}".format(c.message))
+            if ending_title:
+                parts.append("     相关结局：{0}".format(ending_title))
+            if c.related_chapter:
+                parts.append("     建议章节：第 {0} 章".format(c.related_chapter))
+            if c.dialogue_ref:
+                parts.append("     相关台词：「{0}」".format(c.dialogue_ref))
+            parts.append("     修改建议：{0}".format(c.suggestion))
+            return "\n".join(parts)
 
     def _update_health(self):
         if not self._results_cache:
@@ -525,7 +969,17 @@ class ContradictionPanel(QWidget):
                 """.format(" ｜ ".join(state_parts))
 
         dialogue_block = ""
-        if issue.dialogue_ref:
+        if issue.merged_dialogues and len(issue.merged_dialogues) > 1:
+            dialogue_html = "<br>".join(
+                "「{0}」".format(d) for d in issue.merged_dialogues
+            )
+            dialogue_block = """
+            <div style="background: #3a2e2e; padding: 10px; border-radius: 6px; margin-bottom: 12px; border-left: 4px solid #ff9999;">
+                <b style="color: #ffcc99;">🎬 相关台词（共 {0} 处引用）：</b><br>
+                <span style="color: #fff; font-style: italic;">{1}</span>
+            </div>
+            """.format(len(issue.merged_dialogues), dialogue_html)
+        elif issue.dialogue_ref:
             dialogue_block = """
             <div style="background: #3a2e2e; padding: 10px; border-radius: 6px; margin-bottom: 12px; border-left: 4px solid #ff9999;">
                 <b style="color: #ffcc99;">🎬 相关台词：</b><br>
@@ -533,26 +987,35 @@ class ContradictionPanel(QWidget):
             </div>
             """.format(issue.dialogue_ref)
 
+        occ_block = ""
+        if issue.occurrence_count > 1:
+            occ_block = """
+            <div style="background: #3e3e2e; padding: 8px; border-radius: 6px; margin-bottom: 12px;">
+                <b style="color: #ffcc66;">📌 该问题在多条台词中重复出现，共 {0} 次</b>
+            </div>
+            """.format(issue.occurrence_count)
+
         html = """
         <div style="padding: 4px;">
             <h3 style="color: {0}; margin: 0 0 10px 0;">【{1}】{2}</h3>
             {3}
             {4}
+            {5}
             <div style="background: #333340; padding: 10px; border-radius: 6px; margin-bottom: 12px;">
                 <b style="color: #ffcc99;">💬 具体问题：</b><br>
-                <span style="color: #fff;">{5}</span>
+                <span style="color: #fff;">{6}</span>
             </div>
             <div style="background: #2e3b2e; padding: 10px; border-radius: 6px; margin-bottom: 12px; border: 1px solid #3e5b3e;">
                 <b style="color: #9fe59f;">💡 修改建议：</b><br>
-                <span style="color: #e6ffe6;">{6}</span>
+                <span style="color: #e6ffe6;">{7}</span>
             </div>
             <div style="color: #888; font-size: 12px;">
-                📍 关联信息：{7}
+                📍 关联信息：{8}
             </div>
         </div>
         """.format(
             sev_color.name(), sev_label, issue.category,
-            dialogue_block, path_state_block,
+            occ_block, dialogue_block, path_state_block,
             issue.message, issue.suggestion, related_text
         )
         return html

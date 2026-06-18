@@ -32,6 +32,24 @@ class ChoiceScore:
 
 
 @dataclass
+class FullBranchResult:
+    choice: Choice
+    final_state: GameState
+    timeline_snippet: List["TimelineStep"]
+    triggered_events: List[Event]
+    skipped_events: List[Event]
+    fear_final: int = 0
+    clues_final: List[str] = field(default_factory=list)
+    characters_final: Dict[str, CharacterStatus] = field(default_factory=dict)
+    flags_final: List[str] = field(default_factory=list)
+    closest_ending_id: Optional[str] = None
+    closest_ending_name: str = ""
+    closest_ending_score: int = 0
+    ending_scores: Dict[str, int] = field(default_factory=dict)
+    dialogue_issues: List["Contradiction"] = field(default_factory=list)
+
+
+@dataclass
 class BranchPreview:
     choice: Choice
     state_after: GameState
@@ -42,6 +60,7 @@ class BranchPreview:
     flags_set: List[str] = field(default_factory=list)
     flags_unset: List[str] = field(default_factory=list)
     ending_closeness: Dict[str, int] = field(default_factory=dict)
+    full_branch: Optional[FullBranchResult] = None
 
 
 @dataclass
@@ -86,6 +105,8 @@ class Contradiction:
     dialogue_ref: Optional[str] = None
     nav_target_type: Optional[str] = None
     nav_target_id: Optional[str] = None
+    occurrence_count: int = 1
+    merged_dialogues: List[str] = field(default_factory=list)
 
 
 class DialogueAnalyzer:
@@ -138,17 +159,23 @@ class DialogueAnalyzer:
                             chars.add(effect.target)
         return chars
 
-    def analyze_dialogue(self, dialogue: str, ending: Ending, final_state: GameState) -> List[Contradiction]:
+    def analyze_dialogue(
+        self, dialogue: str, ending: Ending, final_state: GameState,
+        visited_locations: Optional[Set[str]] = None,
+        obtained_clues: Optional[Set[str]] = None,
+    ) -> List[Contradiction]:
         issues: List[Contradiction] = []
         seen_keys: Set[str] = set()
         refs = self.extract_references(dialogue)
+        visited_locs = visited_locations or set()
+        obtained = obtained_clues or set()
 
         for ref in refs:
             if ref.reference_type == "clue":
                 dedup_key = "clue::{0}::{1}".format(ref.reference, ending.id)
                 if dedup_key in seen_keys:
                     continue
-                if ref.reference not in final_state.clues or not final_state.clues[ref.reference]:
+                if ref.reference not in obtained:
                     seen_keys.add(dedup_key)
                     provider = self._find_provider_event_for_clue(ref.reference)
                     ch_num = provider.chapter if provider else None
@@ -166,6 +193,8 @@ class DialogueAnalyzer:
                         dialogue_ref=dialogue,
                         nav_target_type="event",
                         nav_target_id=provider.id if provider else ending.id,
+                        occurrence_count=1,
+                        merged_dialogues=[dialogue],
                     ))
             elif ref.reference_type == "character":
                 expected_status = self._infer_char_status_from_dialogue(dialogue, ref.reference)
@@ -199,13 +228,15 @@ class DialogueAnalyzer:
                         dialogue_ref=dialogue,
                         nav_target_type="event",
                         nav_target_id=provider.id if provider else ending.id,
+                        occurrence_count=1,
+                        merged_dialogues=[dialogue],
                     ))
             elif ref.reference_type == "location":
                 dedup_key = "loc::{0}::{1}".format(ref.reference, ending.id)
                 if dedup_key in seen_keys:
                     continue
                 seen_keys.add(dedup_key)
-                if not self._is_location_provided(ref.reference, final_state):
+                if not self._is_location_provided_current_path(ref.reference, visited_locs, obtained):
                     provider = self._find_provider_event_for_location(ref.reference)
                     ch_num = provider.chapter if provider else None
                     issues.append(Contradiction(
@@ -221,9 +252,22 @@ class DialogueAnalyzer:
                         dialogue_ref=dialogue,
                         nav_target_type="event",
                         nav_target_id=provider.id if provider else ending.id,
+                        occurrence_count=1,
+                        merged_dialogues=[dialogue],
                     ))
 
         return issues
+
+    def _is_location_provided_current_path(
+        self, location: str, visited_locations: Set[str], obtained_clues: Set[str]
+    ) -> bool:
+        visited_flag = "去过_{0}".format(location)
+        if visited_flag in visited_locations:
+            return True
+        for clue in obtained_clues:
+            if location in clue:
+                return True
+        return False
 
     def _is_location_provided(self, location: str, final_state: GameState) -> bool:
         visited_flag = "去过_{0}".format(location)
@@ -402,8 +446,124 @@ class CausalityValidator:
                 return choice
         return None
 
+    def _simulate_from_choice(
+        self, start_step_index: int, choice: Choice,
+        start_state: GameState, target_ending: Optional[Ending] = None,
+    ) -> FullBranchResult:
+        state = start_state.clone()
+        for effect in choice.effects:
+            effect.apply(state)
+
+        timeline_snippet: List[TimelineStep] = []
+        triggered = []
+        skipped = []
+
+        visited_locations: Set[str] = set()
+        obtained_clues: Set[str] = set()
+        for k, v in self._initial_state.clues.items():
+            if v:
+                obtained_clues.add(k)
+        for k, v in state.clues.items():
+            if v:
+                obtained_clues.add(k)
+
+        for effect in choice.effects:
+            if effect.effect_type == ChoiceEffectType.SET_FLAG and effect.target.startswith("去过_"):
+                visited_locations.add(effect.target)
+            if effect.effect_type == ChoiceEffectType.SET_CLUE and effect.value:
+                obtained_clues.add(effect.target)
+
+        for step_idx in range(start_step_index, len(self._sorted_events)):
+            event = self._sorted_events[step_idx]
+            step = TimelineStep(
+                event=event,
+                step_index=step_idx,
+                state_before=state.clone(),
+            )
+
+            broken = [c for c in event.conditions if not c.evaluate(state)]
+            met = [c for c in event.conditions if c.evaluate(state)]
+            step.broken_event_conditions = broken
+            step.met_event_conditions = met
+
+            if broken:
+                step.event_condition_status = LinkStatus.SKIPPED
+                step.was_triggered = False
+                step.state_after = state.clone()
+                skipped.append(event)
+                timeline_snippet.append(step)
+                continue
+
+            step.event_condition_status = LinkStatus.VALID
+            step.was_triggered = True
+            triggered.append(event)
+
+            ending_for_pick = target_ending or self.endings[0] if self.endings else None
+            if ending_for_pick:
+                choice_scores = self._score_all_choices(event, ending_for_pick, state)
+                best_choice = self._pick_best_choice(choice_scores)
+            else:
+                best_choice = event.choices[0] if event.choices else None
+
+            step.selected_choice = best_choice
+            if best_choice is not None:
+                for effect in best_choice.effects:
+                    effect.apply(state)
+                    step.choice_effects_applied.append(effect)
+                    if effect.effect_type == ChoiceEffectType.SET_FLAG and effect.target.startswith("去过_"):
+                        visited_locations.add(effect.target)
+                    if effect.effect_type == ChoiceEffectType.SET_CLUE and effect.value:
+                        obtained_clues.add(effect.target)
+
+            step.state_after = state.clone()
+            timeline_snippet.append(step)
+
+        final_clues = [k for k, v in state.clues.items() if v]
+        final_flags = [k for k, v in state.flags.items() if v]
+
+        ending_scores: Dict[str, int] = {}
+        best_score = -1
+        best_ending_id = None
+        best_ending_name = ""
+        for ending in self.endings:
+            met = sum(1 for cond in ending.conditions if cond.evaluate(state))
+            total = len(ending.conditions)
+            score = met * 100 // max(total, 1)
+            ending_scores[ending.id] = score
+            if score > best_score:
+                best_score = score
+                best_ending_id = ending.id
+                best_ending_name = ending.title
+
+        dialogue_issues: List[Contradiction] = []
+        if target_ending:
+            for dialogue in target_ending.dialogue_hints:
+                issues = self._dialogue_analyzer.analyze_dialogue(
+                    dialogue, target_ending, state,
+                    visited_locations, obtained_clues,
+                )
+                dialogue_issues.extend(issues)
+
+        return FullBranchResult(
+            choice=choice,
+            final_state=state.clone(),
+            timeline_snippet=timeline_snippet,
+            triggered_events=triggered,
+            skipped_events=skipped,
+            fear_final=state.fear_level,
+            clues_final=final_clues,
+            characters_final=dict(state.characters),
+            flags_final=final_flags,
+            closest_ending_id=best_ending_id,
+            closest_ending_name=best_ending_name,
+            closest_ending_score=best_score,
+            ending_scores=ending_scores,
+            dialogue_issues=dialogue_issues,
+        )
+
     def _compute_branch_preview(
-        self, event: Event, choice: Choice, current_state: GameState, endings: List[Ending]
+        self, event: Event, choice: Choice, current_state: GameState, endings: List[Ending],
+        step_index: int = 0, target_ending: Optional[Ending] = None,
     ) -> BranchPreview:
         temp_state = current_state.clone()
         for effect in choice.effects:
@@ -428,6 +588,10 @@ class CausalityValidator:
             met = sum(1 for cond in ending.conditions if cond.evaluate(temp_state))
             ending_closeness[ending.id] = met
 
+        full_branch = self._simulate_from_choice(
+            step_index + 1, choice, current_state, target_ending,
+        )
+
         return BranchPreview(
             choice=choice,
             state_after=temp_state,
@@ -438,6 +602,7 @@ class CausalityValidator:
             flags_set=flags_set,
             flags_unset=flags_unset,
             ending_closeness=ending_closeness,
+            full_branch=full_branch,
         )
 
     def simulate_path_to_ending(
@@ -447,6 +612,15 @@ class CausalityValidator:
         state = base_initial.clone()
         timeline: List[TimelineStep] = []
         contradictions: List[Contradiction] = []
+
+        visited_locations: Set[str] = set()
+        obtained_clues: Set[str] = set()
+        for k, v in base_initial.clues.items():
+            if v:
+                obtained_clues.add(k)
+        for k, v in base_initial.flags.items():
+            if v and k.startswith("去过_"):
+                visited_locations.add(k)
 
         for step_idx, event in enumerate(self._sorted_events):
             step = TimelineStep(
@@ -465,7 +639,9 @@ class CausalityValidator:
 
             branch_previews = []
             for choice in event.choices:
-                bp = self._compute_branch_preview(event, choice, state, self.endings)
+                bp = self._compute_branch_preview(
+                    event, choice, state, self.endings, step_idx, ending,
+                )
                 branch_previews.append(bp)
             step.all_branch_previews = branch_previews
 
@@ -478,9 +654,6 @@ class CausalityValidator:
                     source_event = self._find_source_event_for_condition(cond)
                     nav_type = "event"
                     nav_id = source_event.id if source_event else event.id
-                    if cond.condition_type in (ConditionType.HAS_CLUE, ConditionType.FLAG_TRUE):
-                        nav_type = "event"
-                        nav_id = source_event.id if source_event else event.id
                     contradictions.append(Contradiction(
                         severity="error",
                         category="事件条件冲突",
@@ -510,6 +683,10 @@ class CausalityValidator:
                 for effect in best_choice.effects:
                     effect.apply(state)
                     step.choice_effects_applied.append(effect)
+                    if effect.effect_type == ChoiceEffectType.SET_FLAG and effect.target.startswith("去过_"):
+                        visited_locations.add(effect.target)
+                    if effect.effect_type == ChoiceEffectType.SET_CLUE and effect.value:
+                        obtained_clues.add(effect.target)
                 if self._is_choice_optimal(best_choice, choice_scores):
                     step.note = "（最优路径）"
                 else:
@@ -521,6 +698,10 @@ class CausalityValidator:
                     for effect in first.effects:
                         effect.apply(state)
                         step.choice_effects_applied.append(effect)
+                        if effect.effect_type == ChoiceEffectType.SET_FLAG and effect.target.startswith("去过_"):
+                            visited_locations.add(effect.target)
+                        if effect.effect_type == ChoiceEffectType.SET_CLUE and effect.value:
+                            obtained_clues.add(effect.target)
                     step.selected_choice = first
                     step.note = "（无贴合结局的选项，使用默认）"
                     step.event_condition_status = LinkStatus.WARN
@@ -541,14 +722,22 @@ class CausalityValidator:
                     cond, state, ending, timeline
                 ))
 
-        seen_dialogue_keys: Set[str] = set()
+        merged_issues: Dict[str, Contradiction] = {}
         for dialogue in ending.dialogue_hints:
-            issues = self._dialogue_analyzer.analyze_dialogue(dialogue, ending, state)
+            issues = self._dialogue_analyzer.analyze_dialogue(
+                dialogue, ending, state, visited_locations, obtained_clues,
+            )
             for issue in issues:
                 dedup = "{0}::{1}::{2}".format(issue.category, issue.message[:40], issue.related_ending_id or "")
-                if dedup not in seen_dialogue_keys:
-                    seen_dialogue_keys.add(dedup)
-                    contradictions.append(issue)
+                if dedup in merged_issues:
+                    existing = merged_issues[dedup]
+                    existing.occurrence_count += 1
+                    if dialogue not in existing.merged_dialogues:
+                        existing.merged_dialogues.append(dialogue)
+                else:
+                    merged_issues[dedup] = issue
+
+        contradictions.extend(merged_issues.values())
 
         overall = LinkStatus.VALID
         if missing_conditions:
@@ -642,12 +831,38 @@ class CausalityValidator:
                     return event
         return None
 
+    def _find_best_event_for_condition(
+        self, condition: Condition, timeline: List[TimelineStep]
+    ) -> Tuple[Optional[Event], Optional[int]]:
+        best_event = None
+        best_chapter = None
+
+        source_event = self._find_source_event_for_condition(condition)
+        if source_event:
+            best_event = source_event
+            best_chapter = source_event.chapter
+
+        for step in reversed(timeline):
+            if not step.was_triggered:
+                continue
+            temp_state = step.state_before.clone()
+            for choice in step.event.choices:
+                test_state = temp_state.clone()
+                for effect in choice.effects:
+                    effect.apply(test_state)
+                if condition.evaluate(test_state):
+                    if best_event is None or step.event.chapter < best_chapter:
+                        best_event = step.event
+                        best_chapter = step.event.chapter
+
+        return best_event, best_chapter
+
     def _condition_progressing(
         self, cond: Condition, before: GameState, after: GameState
     ) -> bool:
         if cond.condition_type in (
             ConditionType.HAS_CLUE, ConditionType.CHAR_DEAD,
-            ConditionType.CHAR_MISSING, ConditionType.CHAR_INSANE,
+            ConditionType.MISSING, ConditionType.INSANE,
             ConditionType.FLAG_TRUE,
         ):
             return (not cond.evaluate(before)) and (cond.evaluate(after))
@@ -665,11 +880,12 @@ class CausalityValidator:
         timeline: List[TimelineStep],
     ) -> Contradiction:
         source_event = self._find_source_event_for_condition(cond)
+        best_event, best_chapter = self._find_best_event_for_condition(cond, timeline)
 
         suggestion_parts = []
-        if source_event:
+        if best_event:
             suggestion_parts.append(
-                "可在第{0}章「{1}」中通过选择提供该条件。".format(source_event.chapter, source_event.title)
+                "可在第{0}章「{1}」中通过选择提供该条件。".format(best_chapter, best_event.title)
             )
             alt_steps = self._find_earlier_opportunity(cond, timeline)
             if alt_steps:
@@ -678,6 +894,10 @@ class CausalityValidator:
                         alt_steps[0].event.chapter, alt_steps[0].event.title
                     )
                 )
+        elif source_event:
+            suggestion_parts.append(
+                "可在第{0}章「{1}」中通过选择提供该条件。".format(source_event.chapter, source_event.title)
+            )
         else:
             suggestion_parts.append(
                 "目前所有事件中均无选项可以产生该条件，请考虑在合适章节增加铺垫事件。"
@@ -693,7 +913,10 @@ class CausalityValidator:
 
         nav_type = "ending"
         nav_id = ending.id
-        if source_event:
+        if best_event:
+            nav_type = "event"
+            nav_id = best_event.id
+        elif source_event:
             nav_type = "event"
             nav_id = source_event.id
 
@@ -707,8 +930,8 @@ class CausalityValidator:
             suggestion=" ".join(suggestion_parts),
             related_ending_id=ending.id,
             related_condition_id=cond.id,
-            related_event_id=source_event.id if source_event else None,
-            related_chapter=source_event.chapter if source_event else None,
+            related_event_id=best_event.id if best_event else (source_event.id if source_event else None),
+            related_chapter=best_chapter if best_chapter else (source_event.chapter if source_event else None),
             nav_target_type=nav_type,
             nav_target_id=nav_id,
         )
@@ -743,15 +966,44 @@ class CausalityValidator:
     ) -> List[Contradiction]:
         final_state = result.final_state or GameState()
         all_issues: List[Contradiction] = []
-        seen: Set[str] = set()
+        merged: Dict[str, Contradiction] = {}
+
+        visited_locations: Set[str] = set()
+        obtained_clues: Set[str] = set()
+
+        if result.initial_state_used:
+            for k, v in result.initial_state_used.clues.items():
+                if v:
+                    obtained_clues.add(k)
+            for k, v in result.initial_state_used.flags.items():
+                if v and k.startswith("去过_"):
+                    visited_locations.add(k)
+
+        for step in result.timeline:
+            if not step.was_triggered:
+                continue
+            for effect in step.choice_effects_applied:
+                if effect.effect_type == ChoiceEffectType.SET_FLAG and effect.target.startswith("去过_"):
+                    visited_locations.add(effect.target)
+                if effect.effect_type == ChoiceEffectType.SET_CLUE and effect.value:
+                    obtained_clues.add(effect.target)
+
         for dialogue in ending.dialogue_hints:
-            issues = self._dialogue_analyzer.analyze_dialogue(dialogue, ending, final_state)
+            issues = self._dialogue_analyzer.analyze_dialogue(
+                dialogue, ending, final_state,
+                visited_locations, obtained_clues,
+            )
             for issue in issues:
                 dedup = "{0}::{1}::{2}".format(issue.category, issue.message[:40], issue.related_ending_id or "")
-                if dedup not in seen:
-                    seen.add(dedup)
-                    all_issues.append(issue)
-        return all_issues
+                if dedup in merged:
+                    existing = merged[dedup]
+                    existing.occurrence_count += 1
+                    if dialogue not in existing.merged_dialogues:
+                        existing.merged_dialogues.append(dialogue)
+                else:
+                    merged[dedup] = issue
+
+        return list(merged.values())
 
     def get_known_entities(self) -> dict:
         return {

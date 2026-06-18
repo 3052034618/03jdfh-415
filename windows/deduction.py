@@ -99,52 +99,120 @@ class BranchCompareDialog(QDialog):
         right_text = right_bp.choice.text or "(未命名)"
         rows.append(("选择", left_text, right_text))
 
-        left_fear = "恐惧值: {0} ({1}{2})".format(
-            left_bp.state_after.fear_level,
-            "+" if left_bp.fear_diff >= 0 else "",
-            left_bp.fear_diff,
-        )
-        right_fear = "恐惧值: {0} ({1}{2})".format(
-            right_bp.state_after.fear_level,
-            "+" if right_bp.fear_diff >= 0 else "",
-            right_bp.fear_diff,
-        )
-        rows.append(("恐惧值变化", left_fear, right_fear))
+        left_full = left_bp.full_branch
+        right_full = right_bp.full_branch
 
-        left_clues = "获得: {0}".format(", ".join(left_bp.clues_added) if left_bp.clues_added else "无")
-        right_clues = "获得: {0}".format(", ".join(right_bp.clues_added) if right_bp.clues_added else "无")
-        rows.append(("线索获得", left_clues, right_clues))
+        if left_full and right_full:
+            left_fear_final = "最终恐惧值: {0}".format(left_full.fear_final)
+            right_fear_final = "最终恐惧值: {0}".format(right_full.fear_final)
+            if left_full.fear_final != right_full.fear_final:
+                left_fear_final += " (差异: {0}{1})".format(
+                    "+" if left_full.fear_final > right_full.fear_final else "",
+                    left_full.fear_final - right_full.fear_final
+                )
+                right_fear_final += " (差异: {0}{1})".format(
+                    "+" if right_full.fear_final > left_full.fear_final else "",
+                    right_full.fear_final - left_full.fear_final
+                )
+            rows.append(("🔮 最终恐惧值", left_fear_final, right_fear_final))
 
-        if left_bp.clues_removed or right_bp.clues_removed:
-            left_lost = "失去: {0}".format(", ".join(left_bp.clues_removed) if left_bp.clues_removed else "无")
-            right_lost = "失去: {0}".format(", ".join(right_bp.clues_removed) if right_bp.clues_removed else "无")
-            rows.append(("线索失去", left_lost, right_lost))
+            left_clues_final = "掌握线索 ({0}条): {1}".format(
+                len(left_full.clues_final),
+                ", ".join(left_full.clues_final[:6]) + ("..." if len(left_full.clues_final) > 6 else "")
+            )
+            right_clues_final = "掌握线索 ({0}条): {1}".format(
+                len(right_full.clues_final),
+                ", ".join(right_full.clues_final[:6]) + ("..." if len(right_full.clues_final) > 6 else "")
+            )
+            rows.append(("🔮 最终线索", left_clues_final, right_clues_final))
 
-        left_chars = "无变化"
-        if left_bp.chars_changed:
-            parts = []
-            for cid, (old, new) in left_bp.chars_changed.items():
-                parts.append("{0}: {1}→{2}".format(cid, str(old), str(new)))
-            left_chars = "; ".join(parts)
-        right_chars = "无变化"
-        if right_bp.chars_changed:
-            parts = []
-            for cid, (old, new) in right_bp.chars_changed.items():
-                parts.append("{0}: {1}→{2}".format(cid, str(old), str(new)))
-            right_chars = "; ".join(parts)
-        rows.append(("角色状态变化", left_chars, right_chars))
+            left_chars_final_parts = []
+            for cid, status in left_full.characters_final.items():
+                left_chars_final_parts.append("{0}: {1}".format(cid, str(status)))
+            left_chars_final = "角色状态: {0}".format(
+                "; ".join(left_chars_final_parts) if left_chars_final_parts else "无"
+            )
+            right_chars_final_parts = []
+            for cid, status in right_full.characters_final.items():
+                right_chars_final_parts.append("{0}: {1}".format(cid, str(status)))
+            right_chars_final = "角色状态: {0}".format(
+                "; ".join(right_chars_final_parts) if right_chars_final_parts else "无"
+            )
+            rows.append(("🔮 最终角色", left_chars_final, right_chars_final))
 
-        left_flags = "设置: {0}".format(", ".join(left_bp.flags_set[:5]) if left_bp.flags_set else "无")
-        right_flags = "设置: {0}".format(", ".join(right_bp.flags_set[:5]) if right_bp.flags_set else "无")
-        rows.append(("标记变化", left_flags, right_flags))
+            left_triggered = len(left_full.triggered_events)
+            right_triggered = len(right_full.triggered_events)
+            left_skipped = len(left_full.skipped_events)
+            right_skipped = len(right_full.skipped_events)
+            rows.append(("🔮 事件触发", "触发{0} / 跳过{1}".format(left_triggered, left_skipped), "触发{0} / 跳过{1}".format(right_triggered, right_skipped)))
 
-        for ending in self._endings:
-            left_met = left_bp.ending_closeness.get(ending.id, 0)
-            right_met = right_bp.ending_closeness.get(ending.id, 0)
-            total = len(ending.conditions)
-            left_str = "{0}/{1}".format(left_met, total)
-            right_str = "{0}/{1}".format(right_met, total)
-            rows.append(("→ " + ending.title, left_str, right_str))
+            left_closest = "无"
+            if left_full.closest_ending_name:
+                left_closest = "{0} ({1}%)".format(left_full.closest_ending_name, left_full.closest_ending_score)
+            right_closest = "无"
+            if right_full.closest_ending_name:
+                right_closest = "{0} ({1}%)".format(right_full.closest_ending_name, right_full.closest_ending_score)
+            rows.append(("🎯 最接近结局", left_closest, right_closest))
+
+            if left_full.dialogue_issues or right_full.dialogue_issues:
+                left_issues = len(left_full.dialogue_issues)
+                right_issues = len(right_full.dialogue_issues)
+                rows.append(("⚠ 台词矛盾", "{0} 处".format(left_issues) if left_issues > 0 else "无", "{0} 处".format(right_issues) if right_issues > 0 else "无"))
+
+            for ending in self._endings:
+                left_score = left_full.ending_scores.get(ending.id, 0)
+                right_score = right_full.ending_scores.get(ending.id, 0)
+                left_str = "{0}%".format(left_score)
+                right_str = "{0}%".format(right_score)
+                rows.append(("🎬 " + ending.title, left_str, right_str))
+
+        else:
+            left_fear = "恐惧值: {0} ({1}{2})".format(
+                left_bp.state_after.fear_level,
+                "+" if left_bp.fear_diff >= 0 else "",
+                left_bp.fear_diff,
+            )
+            right_fear = "恐惧值: {0} ({1}{2})".format(
+                right_bp.state_after.fear_level,
+                "+" if right_bp.fear_diff >= 0 else "",
+                right_bp.fear_diff,
+            )
+            rows.append(("即时恐惧值", left_fear, right_fear))
+
+            left_clues = "获得: {0}".format(", ".join(left_bp.clues_added) if left_bp.clues_added else "无")
+            right_clues = "获得: {0}".format(", ".join(right_bp.clues_added) if right_bp.clues_added else "无")
+            rows.append(("线索获得", left_clues, right_clues))
+
+            if left_bp.clues_removed or right_bp.clues_removed:
+                left_lost = "失去: {0}".format(", ".join(left_bp.clues_removed) if left_bp.clues_removed else "无")
+                right_lost = "失去: {0}".format(", ".join(right_bp.clues_removed) if right_bp.clues_removed else "无")
+                rows.append(("线索失去", left_lost, right_lost))
+
+            left_chars = "无变化"
+            if left_bp.chars_changed:
+                parts = []
+                for cid, (old, new) in left_bp.chars_changed.items():
+                    parts.append("{0}: {1}→{2}".format(cid, str(old), str(new)))
+                left_chars = "; ".join(parts)
+            right_chars = "无变化"
+            if right_bp.chars_changed:
+                parts = []
+                for cid, (old, new) in right_bp.chars_changed.items():
+                    parts.append("{0}: {1}→{2}".format(cid, str(old), str(new)))
+                right_chars = "; ".join(parts)
+            rows.append(("角色状态变化", left_chars, right_chars))
+
+            left_flags = "设置: {0}".format(", ".join(left_bp.flags_set[:5]) if left_bp.flags_set else "无")
+            right_flags = "设置: {0}".format(", ".join(right_bp.flags_set[:5]) if right_bp.flags_set else "无")
+            rows.append(("标记变化", left_flags, right_flags))
+
+            for ending in self._endings:
+                left_met = left_bp.ending_closeness.get(ending.id, 0)
+                right_met = right_bp.ending_closeness.get(ending.id, 0)
+                total = len(ending.conditions)
+                left_str = "{0}/{1}".format(left_met, total)
+                right_str = "{0}/{1}".format(right_met, total)
+                rows.append(("→ " + ending.title, left_str, right_str))
 
         self.table.setRowCount(len(rows))
         for r, (dim, left_val, right_val) in enumerate(rows):
@@ -158,6 +226,9 @@ class BranchCompareDialog(QDialog):
             self.table.setItem(r, 0, dim_item)
             self.table.setItem(r, 1, left_item)
             self.table.setItem(r, 2, right_item)
+
+        for i in range(3):
+            self.table.resizeColumnToContents(i)
 
 
 class EndingEditDialog(QDialog):
