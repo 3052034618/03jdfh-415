@@ -101,6 +101,7 @@ class MainWindow(QMainWindow):
         self.panel_event.data_changed.connect(self._on_data_changed)
         self.panel_deduction.data_changed.connect(self._on_data_changed)
         self.panel_deduction.navigate_event_requested.connect(self._navigate_to_event)
+        self.panel_deduction.navigate_ending_requested.connect(self._navigate_to_ending)
         self.panel_contradiction.navigate_event_requested.connect(self._navigate_to_event)
         self.panel_contradiction.navigate_ending_requested.connect(self._navigate_to_ending)
 
